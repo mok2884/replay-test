@@ -19,19 +19,19 @@ jobs:
 
       - name: Build
         run: >
-          pyinstaller --noconfirm --windowed --onedir --name ReplayTest
-          --collect-all _sounddevice_data replay_test.py
+          pyinstaller --noconfirm --windowed --onedir --name Replay
+          --collect-all _sounddevice_data replay.py
 
       - name: Self-test the exe
         shell: pwsh
         run: |
-          $p = Start-Process -FilePath "dist\ReplayTest\ReplayTest.exe" -ArgumentList "--self-test" -Wait -PassThru
-          Get-Content "dist\ReplayTest\selftest.txt" -Encoding UTF8
+          $p = Start-Process -FilePath "dist\Replay\Replay.exe" -ArgumentList "--self-test" -Wait -PassThru
+          Get-Content "dist\Replay\selftest.txt" -Encoding UTF8
           if ($p.ExitCode -ne 0) { exit 1 }
-          Remove-Item "dist\ReplayTest\selftest.txt"
+          Remove-Item "dist\Replay\selftest.txt"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ReplayTest-windows
-          path: dist/ReplayTest
+          name: Replay-windows
+          path: dist/Replay
           if-no-files-found: error
