@@ -1,0 +1,7 @@
+__pycache__/
+build/
+dist/
+*.spec
+error.log
+selftest.txt
+vocoder_config.json
