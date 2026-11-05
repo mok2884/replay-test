@@ -765,21 +765,23 @@ def tune_windows():
 
 
 # -------------------------------------------------------------- 画面 -------
-BG = "#c9ccd0"
-PANEL = "#dfe1e4"
-RAISED = "#eeeff1"
-LINE = "#8f949a"
-TEXT = "#191c1f"
-MUTED = "#40454b"
-WAVE_BG = "#eff0f2"
-EMPTY_BG = "#bcc0c5"
-RULER_BG = "#b4b8bd"
-GRID = "#dcdee1"
-WAVE = "#174fb3"
-MARK = "#a84f00"
-HEAD = "#50565c"
-SEG_OFF = "#bcc0c5"
-SEG_A = "#0c6d62"
+BG = "#7f8388"
+PANEL = "#f2f3f4"
+RAISED = "#ffffff"
+LINE = "#555a60"
+TEXT = "#101214"
+MUTED = "#3a3f44"
+WAVE_BG = "#ffffff"
+EMPTY_BG = "#d8dadd"
+RULER_BG = "#2a2d31"
+RULER_TEXT = "#ffffff"
+RULER_ALERT = "#ff9a9f"
+GRID = "#e4e6e8"
+WAVE = "#0f3f9e"
+MARK = "#b24f00"
+HEAD = "#3a3f44"
+SEG_OFF = "#d0d3d6"
+SEG_A = "#0a6a5e"
 SEG_B = "#a87400"
 SEG_C = "#b42f20"
 RED = "#cf2a35"
@@ -791,7 +793,8 @@ CUE_LINE = "#8a6800"
 LCD = "#0d0f0e"
 LCD_TEXT = "#f2a93b"
 LED_OK = "#18805f"
-NOTICE = "#6b5000"
+NOTICE = "#101214"
+HEADER_ALERT = "#4a060b"
 RULER_H = 30
 
 
@@ -1074,10 +1077,10 @@ class App:
         bar.pack(side="bottom", fill="x")
         self.status_items = {}
         for key in ("state", "format", "latency", "dropouts", "memory", "disk"):
-            label = tk.Label(bar, text="", font=self.f_mono, fg=TEXT, bg=RULER_BG)
+            label = tk.Label(bar, text="", font=self.f_mono, fg=RULER_TEXT, bg=RULER_BG)
             label.pack(side="left", padx=(px(16) if key == "state" else 0, px(20)), pady=px(3))
             self.status_items[key] = label
-        self.status_file = tk.Label(bar, text="", font=self.f_mono, fg=TEXT, bg=RULER_BG)
+        self.status_file = tk.Label(bar, text="", font=self.f_mono, fg=RULER_TEXT, bg=RULER_BG)
         self.status_file.pack(side="right", padx=px(16))
 
     def build(self, parent):
@@ -1097,7 +1100,7 @@ class App:
         self.settings_button.pack(side="right")
         self.reconnect_button = RoundButton(self, header, text="RECONNECT", on_click=self.reconnect, width=108, height=30, radius=15)
         self.reconnect_shown = False
-        self.status = tk.Label(header, text="", font=self.f_small, fg=MUTED, bg=BG, anchor="e")
+        self.status = tk.Label(header, text="", font=self.f_small, fg=TEXT, bg=BG, anchor="e")
         self.status.pack(side="right", padx=px(14), fill="x", expand=True)
 
         guide_panel = RoundPanel(self, parent, pad=8)
@@ -1633,14 +1636,14 @@ class App:
             if x > w:
                 break
             if x >= 0:
-                c.create_line(x, 0, x, ruler, fill=MUTED)
+                c.create_line(x, 0, x, ruler, fill=RULER_TEXT)
                 c.create_line(x, ruler, x, h, fill=GRID)
                 total = int(round(t * 10))
                 hh, rem = divmod(total, 36000)
                 mm, rem = divmod(rem, 600)
                 ss = rem / 10
                 text = f"{hh}:{mm:02d}:{ss:02.0f}" if step >= 1 else f"{hh}:{mm:02d}:{ss:04.1f}"
-                c.create_text(x + self.px(5), self.px(7), text=text, anchor="nw", fill=TEXT, font=self.f_mono)
+                c.create_text(x + self.px(5), self.px(7), text=text, anchor="nw", fill=RULER_TEXT, font=self.f_mono)
             t += step
         c.create_line(0, mid, w, mid, fill=LINE)
         xs, mins, maxs = self.peaks.column_range(start, spp, w)
@@ -1726,15 +1729,15 @@ class App:
             else:
                 self.reconnect_button.pack_forget()
         items = self.status_items
-        items["state"].configure(text="CONNECTED" if ok else "NOT CONNECTED", fg=TEXT if ok else RED_TEXT)
+        items["state"].configure(text="CONNECTED" if ok else "NOT CONNECTED", fg=RULER_TEXT if ok else RULER_ALERT)
         items["format"].configure(text=f"{e.rate / 1000:g} kHz / 16 bit / MONO")
         items["latency"].configure(text=f"LATENCY {e.latency_ms:.0f} ms" if ok else "LATENCY —")
-        items["dropouts"].configure(text=f"DROPOUTS {e.problems}", fg=RED_TEXT if e.problems else TEXT)
+        items["dropouts"].configure(text=f"DROPOUTS {e.problems}", fg=RULER_ALERT if e.problems else RULER_TEXT)
         used = len(e.timeline.chunks) * e.timeline.chunk * 2 / 1e9
         items["memory"].configure(text=f"MEMORY {used:.1f} GB")
         try:
             free = shutil.disk_usage(Path(self.cfg["save_dir"]).anchor or ".").free
-            items["disk"].configure(text=f"DISK {free / 1e9:.0f} GB", fg=RED_TEXT if free < 2e9 else TEXT)
+            items["disk"].configure(text=f"DISK {free / 1e9:.0f} GB", fg=RULER_ALERT if free < 2e9 else RULER_TEXT)
         except OSError:
             items["disk"].configure(text="DISK —")
         self.status_file.configure(text=e.writer.path.name if e.writer is not None else "")
@@ -1742,11 +1745,11 @@ class App:
         if self.notice:
             text, color = self.notice, NOTICE
         elif e.writer is not None and e.writer.error:
-            text, color = e.writer.error, RED_TEXT
+            text, color = e.writer.error, HEADER_ALERT
         elif not ok:
-            text, color = (self.engine_error or "AUDIO STOPPED"), RED_TEXT
+            text, color = (self.engine_error or "AUDIO STOPPED"), HEADER_ALERT
         else:
-            text, color = "", MUTED
+            text, color = "", TEXT
         self.status.configure(text=text, fg=color)
 
     def on_close(self):
