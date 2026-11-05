@@ -505,6 +505,7 @@ class Engine:
         self.last_out = 0.0
         self.has_stream = False
         self.exclusive_failed = False
+        self.latency_ms = 0.0
 
     def set_rate(self, rate):
         """録音がまだ空のときだけ呼ぶ。"""
@@ -635,6 +636,8 @@ class Engine:
             ]
         for s in self.streams:
             s.start()
+        latency = self.streams[-1].latency
+        self.latency_ms = (latency[1] if isinstance(latency, (tuple, list)) else latency) * 1000
 
     def close(self):
         for s in self.streams:
@@ -762,33 +765,33 @@ def tune_windows():
 
 
 # -------------------------------------------------------------- 画面 -------
-BG = "#e4e9f0"
-PANEL = "#f5f7fa"
-RAISED = "#ffffff"
-LINE = "#aab4c2"
-TEXT = "#1b2430"
-MUTED = "#4c5868"
-WAVE_BG = "#ffffff"
-EMPTY_BG = "#d4dbe5"
-RULER_BG = "#c8d1dd"
-GRID = "#e8edf3"
-WAVE = "#1f5fd0"
-MARK = "#c75f00"
-HEAD = "#5f6b7a"
-SEG_OFF = "#d4dbe5"
-SEG_A = "#0f7f8c"
-SEG_B = "#c58a12"
-SEG_C = "#c23d2b"
+BG = "#c9ccd0"
+PANEL = "#dfe1e4"
+RAISED = "#eeeff1"
+LINE = "#8f949a"
+TEXT = "#191c1f"
+MUTED = "#40454b"
+WAVE_BG = "#eff0f2"
+EMPTY_BG = "#bcc0c5"
+RULER_BG = "#b4b8bd"
+GRID = "#dcdee1"
+WAVE = "#174fb3"
+MARK = "#a84f00"
+HEAD = "#50565c"
+SEG_OFF = "#bcc0c5"
+SEG_A = "#0c6d62"
+SEG_B = "#a87400"
+SEG_C = "#b42f20"
 RED = "#cf2a35"
-RED_TEXT = "#b3202b"
+RED_TEXT = "#a81c27"
 GREEN = "#1a7f46"
 YELLOW = "#f2d13c"
 YELLOW_TEXT = "#241d00"
-CUE_LINE = "#a87f00"
+CUE_LINE = "#8a6800"
 LCD = "#0d0f0e"
 LCD_TEXT = "#f2a93b"
 LED_OK = "#18805f"
-NOTICE = "#7a5a00"
+NOTICE = "#6b5000"
 RULER_H = 30
 
 
@@ -912,6 +915,72 @@ class SegmentMeter(tk.Canvas):
         self.lit = lit
 
 
+class TransportButton(tk.Canvas):
+    """再生やマーク移動のボタン。記号と、必要なら下に短い文字を出す。"""
+
+    def __init__(self, app, parent, kind, label="", on_click=None, width=60, height=56, round_shape=False):
+        super().__init__(parent, width=app.px(width), height=app.px(height), bg=PANEL, highlightthickness=0, takefocus=0, cursor="hand2")
+        self.app = app
+        self.kind = kind
+        self.label = label
+        self.on_click = on_click
+        self.round_shape = round_shape
+        self.w, self.h = app.px(width), app.px(height)
+        self.enabled = True
+        self.bind("<ButtonRelease-1>", self._release)
+        self.redraw()
+
+    def _release(self, _event):
+        if self.enabled and self.on_click:
+            self.on_click()
+
+    def set_kind(self, kind=None, enabled=None):
+        changed = False
+        if kind is not None and kind != self.kind:
+            self.kind = kind
+            changed = True
+        if enabled is not None and enabled != self.enabled:
+            self.enabled = enabled
+            changed = True
+        if changed:
+            self.redraw()
+
+    def redraw(self):
+        self.delete("all")
+        app, w, h = self.app, self.w, self.h
+        fg = TEXT if self.enabled else "#8f949a"
+        if self.round_shape:
+            self.create_oval(1, 1, w - 2, h - 2, fill=TEXT if self.enabled else "#8f949a", outline="")
+            fg = RAISED
+        else:
+            round_rect(self, 1, 1, w - 2, h - 2, app.px(12), fill=RAISED, outline=LINE)
+        cx = w / 2
+        cy = h / 2 if not self.label else h * 0.38
+        s = app.px(9)
+
+        def tri(x, direction):
+            self.create_polygon(x, cy - s, x, cy + s, x + direction * s * 1.2, cy, fill=fg, width=0)
+
+        if self.kind == "prev":
+            tri(cx + s * 0.1, -1)
+            tri(cx + s * 1.3, -1)
+        elif self.kind == "next":
+            tri(cx - s * 0.1, 1)
+            tri(cx - s * 1.3, 1)
+        elif self.kind == "live":
+            tri(cx - s * 1.6, 1)
+            tri(cx - s * 0.5, 1)
+            self.create_rectangle(cx + s * 0.8, cy - s, cx + s * 1.15, cy + s, fill=fg, width=0)
+        elif self.kind == "play":
+            self.create_polygon(cx - s * 0.8, cy - s * 1.2, cx - s * 0.8, cy + s * 1.2, cx + s * 1.3, cy, fill=fg, width=0)
+        elif self.kind == "stop":
+            self.create_rectangle(cx - s, cy - s, cx + s, cy + s, fill=fg, width=0)
+        elif self.kind:
+            self.create_text(cx, cy, text=self.kind, fill=fg, font=app.f_transport)
+        if self.label:
+            self.create_text(cx, h * 0.78, text=self.label, fill=fg, font=app.f_mono)
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -940,20 +1009,23 @@ class App:
         families = set(tkfont.families())
         family = next((f for f in ("Yu Gothic UI", "Meiryo UI", "Noto Sans CJK JP") if f in families), "TkDefaultFont")
         mono = next((f for f in ("Consolas", "DejaVu Sans Mono") if f in families), family)
-        self.f_title = (family, -self.px(20), "bold")
+        self.f_title = (family, -self.px(16), "bold")
         self.f_band = (family, -self.px(34), "bold")
-        self.f_clock = (mono, -self.px(54), "bold")
-        self.f_guide = (family, -self.px(19), "bold")
-        self.f_key = (mono, -self.px(16), "bold")
-        self.f_enter = (mono, -self.px(24), "bold")
+        self.f_clock = (mono, -self.px(30), "bold")
+        self.f_guide_title = (family, -self.px(26), "bold")
+        self.f_guide = (family, -self.px(14))
+        self.f_key = (mono, -self.px(12), "bold")
+        self.f_enter = (mono, -self.px(16), "bold")
+        self.f_enter_label = (family, -self.px(13), "bold")
         self.f_mid = (family, -self.px(17), "bold")
-        self.f_body = (family, -self.px(14))
+        self.f_body = (family, -self.px(13))
         self.f_small = (family, -self.px(13))
-        self.f_mono = (mono, -self.px(12))
+        self.f_mono = (mono, -self.px(11))
         self.f_mono_big = (mono, -self.px(18))
-        self.f_speed = (mono, -self.px(18), "bold")
+        self.f_speed = (mono, -self.px(15), "bold")
+        self.f_transport = (mono, -self.px(14), "bold")
 
-        root.title(f"REPLAY {VERSION}")
+        root.title(f"チャレンジREC {VERSION}")
         root.configure(bg=BG)
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
         root.geometry(f"{min(self.px(1320), sw - 40)}x{min(self.px(860), sh - 90)}")
@@ -965,9 +1037,10 @@ class App:
                 pass
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.build_style()
+        self.build_statusbar()
         self.main_view = tk.Frame(root, bg=BG)
         self.build(self.main_view)
-        self.main_view.pack(fill="both", expand=True, padx=self.px(16), pady=self.px(12))
+        self.main_view.pack(fill="both", expand=True, padx=self.px(16), pady=(self.px(6), self.px(9)))
         root.bind("<KeyPress>", self.on_key)
         root.bind("<KeyRelease>", self.on_key_release)
         root.bind("<FocusOut>", self.on_focus_out)
@@ -995,30 +1068,43 @@ class App:
         self.root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
 
     # ---- 組み立て ----
+    def build_statusbar(self):
+        px = self.px
+        bar = tk.Frame(self.root, bg=RULER_BG, highlightthickness=1, highlightbackground=LINE)
+        bar.pack(side="bottom", fill="x")
+        self.status_items = {}
+        for key in ("state", "format", "latency", "dropouts", "memory", "disk"):
+            label = tk.Label(bar, text="", font=self.f_mono, fg=TEXT, bg=RULER_BG)
+            label.pack(side="left", padx=(px(16) if key == "state" else 0, px(20)), pady=px(3))
+            self.status_items[key] = label
+        self.status_file = tk.Label(bar, text="", font=self.f_mono, fg=TEXT, bg=RULER_BG)
+        self.status_file.pack(side="right", padx=px(16))
+
     def build(self, parent):
         px = self.px
         header = tk.Frame(parent, bg=BG)
-        header.pack(fill="x", pady=(0, px(10)))
-        logo = tk.Canvas(header, width=px(30), height=px(30), bg=BG, highlightthickness=0)
-        logo.create_oval(1, 1, px(29), px(29), fill=RAISED, outline=LINE)
-        logo.create_arc(px(9), px(9), px(21), px(21), start=30, extent=300, style="arc", outline=WAVE, width=px(2))
-        logo.create_line(px(16), px(6), px(20), px(10), px(15), px(12), fill=WAVE, width=px(2))
-        logo.pack(side="left", padx=(0, px(10)))
-        tk.Label(header, text="REPLAY", font=self.f_title, fg=TEXT, bg=BG).pack(side="left")
-        self.not_active = tk.Canvas(header, width=px(102), height=px(26), bg=BG, highlightthickness=0)
-        round_rect(self.not_active, 1, 1, px(100), px(24), px(12), fill=YELLOW, outline="")
-        self.not_active.create_text(px(51), px(13), text="NOT ACTIVE", fill=YELLOW_TEXT, font=self.f_mono)
+        header.pack(fill="x", pady=(0, px(8)))
+        logo = tk.Canvas(header, width=px(22), height=px(22), bg=BG, highlightthickness=0)
+        logo.create_oval(1, 1, px(21), px(21), fill=RAISED, outline=LINE)
+        logo.create_arc(px(6), px(6), px(16), px(16), start=30, extent=300, style="arc", outline=WAVE, width=px(2))
+        logo.pack(side="left", padx=(0, px(8)))
+        tk.Label(header, text="チャレンジREC", font=self.f_title, fg=TEXT, bg=BG).pack(side="left")
+        self.not_active = tk.Canvas(header, width=px(102), height=px(24), bg=BG, highlightthickness=0)
+        round_rect(self.not_active, 1, 1, px(100), px(22), px(11), fill=YELLOW, outline="")
+        self.not_active.create_text(px(51), px(12), text="NOT ACTIVE", fill=YELLOW_TEXT, font=self.f_mono)
         self.not_active_shown = False
-        self.settings_button = RoundButton(self, header, text="設定", on_click=self.open_settings, width=88)
+        self.settings_button = RoundButton(self, header, text="設定", on_click=self.open_settings, width=72, height=30, radius=15)
         self.settings_button.pack(side="right")
-        self.reconnect_button = RoundButton(self, header, text="RECONNECT", on_click=self.reconnect, width=116)
+        self.reconnect_button = RoundButton(self, header, text="RECONNECT", on_click=self.reconnect, width=108, height=30, radius=15)
         self.reconnect_shown = False
         self.status = tk.Label(header, text="", font=self.f_small, fg=MUTED, bg=BG, anchor="e")
         self.status.pack(side="right", padx=px(14), fill="x", expand=True)
 
-        guide_panel = RoundPanel(self, parent, pad=12)
+        guide_panel = RoundPanel(self, parent, pad=8)
         guide_panel.pack(fill="x")
         guide = guide_panel.inner
+        tk.Label(guide, text="操作説明", font=self.f_guide_title, fg=TEXT, bg=PANEL).pack(side="left", padx=(px(6), px(14)))
+        tk.Frame(guide, bg=LINE, width=1).pack(side="left", fill="y", padx=(0, px(14)))
         keys = tk.Frame(guide, bg=PANEL)
         keys.pack(side="left", fill="x", expand=True)
         rows = ((("A–Z", "マーク"), ("↓", "前のマーク"), ("↑", "次のマーク"), ("ESC", "先端に戻る")),
@@ -1028,86 +1114,102 @@ class App:
         for r, row in enumerate(rows):
             for c, (key, text) in enumerate(row):
                 cell = tk.Frame(keys, bg=PANEL)
-                cell.grid(row=r, column=c, sticky="w", pady=px(4))
-                KeyCap(self, cell, key).pack(side="left", padx=(0, px(10)))
+                cell.grid(row=r, column=c, sticky="w", pady=px(2))
+                KeyCap(self, cell, key, width=54, height=26, color=MUTED, border=1, radius=6).pack(side="left", padx=(0, px(8)))
                 tk.Label(cell, text=text, font=self.f_guide, fg=TEXT, bg=PANEL).pack(side="left")
         enter = tk.Frame(guide, bg=PANEL)
-        enter.pack(side="right", padx=(px(20), px(4)))
-        KeyCap(self, enter, "ENTER", width=190, height=58, color=RED_TEXT, border=3, font=self.f_enter, radius=12).pack()
-        tk.Label(enter, text="ONLINE PLAY / STOP", font=self.f_guide, fg=RED_TEXT, bg=PANEL).pack(pady=(px(4), 0))
+        enter.pack(side="right", padx=(px(14), px(4)))
+        KeyCap(self, enter, "ENTER", width=130, height=36, color=RED_TEXT, border=2, font=self.f_enter, radius=8).pack()
+        tk.Label(enter, text="ONLINE PLAY / STOP", font=self.f_enter_label, fg=RED_TEXT, bg=PANEL).pack(pady=(px(2), 0))
 
         self.band = tk.Canvas(parent, height=px(70), bg=BG, highlightthickness=0, takefocus=0)
-        self.band.pack(fill="x", pady=px(10))
+        self.band.pack(fill="x", pady=px(8))
         self.band.bind("<Configure>", lambda _e: self.draw_band(force=True))
 
         row = tk.Frame(parent, bg=BG)
-        row.pack(fill="x", pady=(0, px(10)))
+        row.pack(fill="x", pady=(0, px(8)))
         row.columnconfigure(1, weight=1, uniform="info")
         row.columnconfigure(2, weight=1, uniform="info")
-        clock = RoundPanel(self, row, fill=LCD, pad=10, fit_width=True)
-        clock.grid(row=0, column=0, sticky="ns", padx=(0, px(10)))
-        tk.Label(clock.inner, text="POSITION", font=self.f_mono, fg="#c2c0b9", bg=LCD).pack(anchor="w", padx=px(10))
+        clock = RoundPanel(self, row, fill=LCD, pad=7, radius=10, fit_width=True)
+        clock.grid(row=0, column=0, sticky="ns", padx=(0, px(8)))
+        tk.Label(clock.inner, text="POSITION", font=self.f_mono, fg="#c2c0b9", bg=LCD).pack(side="left", padx=(px(6), px(10)))
         self.pos_label = tk.Label(clock.inner, text="00:00:00.00", font=self.f_clock, fg=LCD_TEXT, bg=LCD)
-        self.pos_label.pack(padx=px(10))
+        self.pos_label.pack(side="left", padx=(0, px(6)))
 
-        speed = RoundPanel(self, row, pad=12)
-        speed.grid(row=0, column=1, sticky="nsew", padx=(0, px(10)))
+        speed = RoundPanel(self, row, pad=7, radius=10)
+        speed.grid(row=0, column=1, sticky="nsew", padx=(0, px(8)))
         line = tk.Frame(speed.inner, bg=PANEL)
-        line.pack(fill="x", expand=True)
+        line.pack(fill="both", expand=True, padx=px(6))
         tk.Label(line, text="CUE SPEED", font=self.f_mono, fg=MUTED, bg=PANEL).pack(side="left")
         self.v_speed = tk.DoubleVar(value=1.5)
         self.speed_scale = ttk.Scale(line, from_=1.0, to=2.0, variable=self.v_speed, takefocus=0, command=self.on_speed)
-        self.speed_scale.pack(side="left", fill="x", expand=True, padx=px(10))
+        self.speed_scale.pack(side="left", fill="x", expand=True, padx=px(8))
         self.speed_label = tk.Label(line, text="1.5×", font=self.f_speed, fg=TEXT, bg=PANEL, width=4)
         self.speed_label.pack(side="left")
         self.v_keep_pitch = tk.BooleanVar(value=True)
-        self.pitch_button = tk.Checkbutton(speed.inner, text="KEEP PITCH", variable=self.v_keep_pitch, font=self.f_mono, fg=MUTED,
+        self.pitch_button = tk.Checkbutton(line, text="KEEP PITCH", variable=self.v_keep_pitch, font=self.f_mono, fg=MUTED,
                                            bg=PANEL, activebackground=PANEL, activeforeground=TEXT, selectcolor=RAISED, takefocus=0,
                                            highlightthickness=0, command=self.on_pitch)
-        self.pitch_button.pack(anchor="w")
+        self.pitch_button.pack(side="left", padx=(px(8), 0))
 
-        devices = RoundPanel(self, row, pad=12)
+        devices = RoundPanel(self, row, pad=7, radius=10)
         devices.grid(row=0, column=2, sticky="nsew")
+        devices.inner.columnconfigure((0, 1), weight=1, uniform="device")
+        devices.inner.rowconfigure(0, weight=1)
         self.device_rows = {}
-        for key, title in (("in", "INPUT"), ("out", "OUTPUT")):
+        for col, (key, title) in enumerate((("in", "INPUT"), ("out", "OUTPUT"))):
             line = tk.Frame(devices.inner, bg=PANEL)
-            line.pack(fill="x", expand=True, pady=px(3))
-            led = tk.Canvas(line, width=px(10), height=px(10), bg=PANEL, highlightthickness=0)
-            item = led.create_oval(0, 0, px(9), px(9), fill=LED_OK, outline="")
-            led.pack(side="left", padx=(0, px(10)))
-            tk.Label(line, text=title, font=self.f_mono, fg=MUTED, bg=PANEL, width=7, anchor="w").pack(side="left")
-            name = tk.Label(line, text="", font=self.f_body, fg=TEXT, bg=PANEL, anchor="w")
+            line.grid(row=0, column=col, sticky="ew", padx=px(4))
+            led = tk.Canvas(line, width=px(9), height=px(9), bg=PANEL, highlightthickness=0)
+            item = led.create_oval(0, 0, px(8), px(8), fill=LED_OK, outline="")
+            led.pack(side="left", padx=(0, px(6)))
+            tk.Label(line, text=title, font=self.f_mono, fg=MUTED, bg=PANEL).pack(side="left", padx=(0, px(6)))
+            # width=1 にして、長い名前は枠の中で切れるようにする
+            name = tk.Label(line, text="", font=self.f_body, fg=TEXT, bg=PANEL, anchor="w", width=1)
             name.pack(side="left", fill="x", expand=True)
             self.device_rows[key] = (led, item, name)
 
         bottom = tk.Frame(parent, bg=BG)
-        bottom.pack(side="bottom", fill="x", pady=(px(10), 0))
-        bottom.columnconfigure(2, weight=1)
-        self.rec_button = RoundButton(self, bottom, text="●  REC START", on_click=self.toggle_record, width=190, height=76, radius=14, font=self.f_mid)
-        self.rec_button.grid(row=0, column=0, sticky="ns", padx=(0, px(10)))
+        bottom.pack(side="bottom", fill="x", pady=(px(8), 0))
+        bottom.columnconfigure(3, weight=1)
+        self.rec_button = RoundButton(self, bottom, text="●  REC START", on_click=self.toggle_record, width=170, height=76, radius=14, font=self.f_mid)
+        self.rec_button.grid(row=0, column=0, sticky="ns", padx=(0, px(8)))
         info = RoundPanel(self, bottom, pad=10, fit_width=True)
-        info.grid(row=0, column=1, sticky="ns", padx=(0, px(10)))
+        info.grid(row=0, column=1, sticky="ns", padx=(0, px(8)))
         length = tk.Frame(info.inner, bg=PANEL)
-        length.pack(side="left", padx=(px(8), px(18)))
+        length.pack(side="left", padx=(px(6), px(14)))
         tk.Label(length, text="LENGTH", font=self.f_mono, fg=MUTED, bg=PANEL).pack(anchor="w")
         self.head_label = tk.Label(length, text="00:00:00", font=self.f_mono_big, fg=MUTED, bg=PANEL)
         self.head_label.pack(anchor="w")
         marks = tk.Frame(info.inner, bg=PANEL)
-        marks.pack(side="left", padx=(0, px(8)))
+        marks.pack(side="left", padx=(0, px(6)))
         tk.Label(marks, text="MARKS", font=self.f_mono, fg=MUTED, bg=PANEL).pack(anchor="w")
         self.marks_label = tk.Label(marks, text="0", font=self.f_mono_big, fg=TEXT, bg=PANEL)
         self.marks_label.pack(anchor="w")
+        transport = RoundPanel(self, bottom, pad=8, fit_width=True)
+        transport.grid(row=0, column=2, sticky="ns", padx=(0, px(8)))
+        self.transport = {}
+        for key, kind, label, command, width, height, is_round in (
+                ("prev", "prev", "MARK", lambda: self.key_mark(-1), 60, 56, False),
+                ("back", "−2s", "", lambda: self.key_jump(-1), 52, 52, False),
+                ("play", "play", "", self.transport_play, 60, 60, True),
+                ("forward", "+2s", "", lambda: self.key_jump(1), 52, 52, False),
+                ("next", "next", "MARK", lambda: self.key_mark(1), 60, 56, False),
+                ("live", "live", "LIVE", self.transport_live, 60, 56, False)):
+            button = TransportButton(self, transport.inner, kind, label, command, width, height, is_round)
+            button.pack(side="left", padx=px(3))
+            self.transport[key] = button
         meters_panel = RoundPanel(self, bottom, pad=12)
-        meters_panel.grid(row=0, column=2, sticky="nsew")
+        meters_panel.grid(row=0, column=3, sticky="nsew")
         meters_panel.inner.columnconfigure(1, weight=1)
         self.meters = {}
         for i, (key, text) in enumerate((("in", "INPUT"), ("main", "MAIN L"), ("cue", "CUE R"))):
-            tk.Label(meters_panel.inner, text=text, font=self.f_mono, fg=MUTED, bg=PANEL, width=7, anchor="w").grid(row=i, column=0, padx=(0, px(10)), pady=px(2))
+            tk.Label(meters_panel.inner, text=text, font=self.f_mono, fg=MUTED, bg=PANEL, width=7, anchor="w").grid(row=i, column=0, padx=(0, px(8)), pady=px(2))
             m = SegmentMeter(self, meters_panel.inner)
             m.grid(row=i, column=1, sticky="ew")
             self.meters[key] = m
 
-        self.wave = tk.Canvas(parent, bg=WAVE_BG, highlightthickness=0, height=px(240), takefocus=0)
+        self.wave = tk.Canvas(parent, bg=WAVE_BG, highlightthickness=0, height=px(200), takefocus=0)
         self.wave.pack(fill="both", expand=True)
         self.wave.bind("<Button-1>", self.on_wave_click)
 
@@ -1156,7 +1258,7 @@ class App:
         self.settings_open = False
         self.settings_view.destroy()
         self.settings_view = None
-        self.main_view.pack(fill="both", expand=True, padx=self.px(16), pady=self.px(12))
+        self.main_view.pack(fill="both", expand=True, padx=self.px(16), pady=(self.px(6), self.px(9)))
         if cfg is not None:
             rate = int(cfg["samplerate"])
             if rate != self.engine.rate and self.engine.timeline.head == 0 and self.engine.writer is None:
@@ -1251,6 +1353,19 @@ class App:
             cue.play_from(self.clamp(pos))
         else:
             cue.locate(self.clamp(pos))
+
+    # ---- ボタン ----
+    def transport_play(self):
+        if self.mode == SEARCH:
+            self.key_space()
+        elif self.mode == LIVE and self.marks:
+            self.key_mark(-1)
+        self.root.focus_set()
+
+    def transport_live(self):
+        if self.mode == SEARCH:
+            self.leave_search()
+        self.root.focus_set()
 
     # ---- キー ----
     @staticmethod
@@ -1581,6 +1696,12 @@ class App:
         self.settings_button.set_style(enabled=not online)
         self.pitch_button.configure(state=state)
         self.speed_scale.configure(state=state)
+        playing = online or (self.mode == SEARCH and e.cue.playing())
+        for key, button in self.transport.items():
+            if key == "play":
+                button.set_kind("stop" if playing else "play", enabled=not online)
+            else:
+                button.set_kind(enabled=not online)
         focused = bool(str(self.root.tk.call("focus"))) if not hasattr(self, "_test_focus") else self._test_focus()
         if focused == self.not_active_shown:
             self.not_active_shown = not focused
@@ -1604,7 +1725,20 @@ class App:
                 self.reconnect_button.pack(side="right", padx=(0, self.px(8)), before=self.settings_button)
             else:
                 self.reconnect_button.pack_forget()
-        color = MUTED
+        items = self.status_items
+        items["state"].configure(text="CONNECTED" if ok else "NOT CONNECTED", fg=TEXT if ok else RED_TEXT)
+        items["format"].configure(text=f"{e.rate / 1000:g} kHz / 16 bit / MONO")
+        items["latency"].configure(text=f"LATENCY {e.latency_ms:.0f} ms" if ok else "LATENCY —")
+        items["dropouts"].configure(text=f"DROPOUTS {e.problems}", fg=RED_TEXT if e.problems else TEXT)
+        used = len(e.timeline.chunks) * e.timeline.chunk * 2 / 1e9
+        items["memory"].configure(text=f"MEMORY {used:.1f} GB")
+        try:
+            free = shutil.disk_usage(Path(self.cfg["save_dir"]).anchor or ".").free
+            items["disk"].configure(text=f"DISK {free / 1e9:.0f} GB", fg=RED_TEXT if free < 2e9 else TEXT)
+        except OSError:
+            items["disk"].configure(text="DISK —")
+        self.status_file.configure(text=e.writer.path.name if e.writer is not None else "")
+        # 普段は空。知らせることがあるときだけ上に出す
         if self.notice:
             text, color = self.notice, NOTICE
         elif e.writer is not None and e.writer.error:
@@ -1612,18 +1746,7 @@ class App:
         elif not ok:
             text, color = (self.engine_error or "AUDIO STOPPED"), RED_TEXT
         else:
-            used = len(e.timeline.chunks) * e.timeline.chunk * 2 / 1e9
-            text = f"MEMORY {used:.1f} GB"
-            try:
-                free = shutil.disk_usage(Path(self.cfg["save_dir"]).anchor or ".").free
-                text += f"   DISK {free / 1e9:.0f} GB"
-                if free < 2e9:
-                    color = NOTICE
-            except OSError:
-                pass
-            if e.problems:
-                text += f"   DROPOUTS {e.problems}"
-                color = NOTICE
+            text, color = "", MUTED
         self.status.configure(text=text, fg=color)
 
     def on_close(self):
