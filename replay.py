@@ -16,7 +16,6 @@ import os
 import queue
 import shutil
 import struct
-import subprocess
 import sys
 import threading
 import time
@@ -24,26 +23,23 @@ import traceback
 from collections import deque
 from pathlib import Path
 
-# sounddevice の Windows 版は、この環境変数があると ASIO 対応版の PortAudio を読み込む。
-os.environ.setdefault("SD_ENABLE_ASIO", "1")
-
 import numpy as np
 import sounddevice as sd
 import tkinter as tk
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 
-APP_NAME = "リプレイ録音機"
-VERSION = "0.1"
+APP_NAME = "REPLAY"
+VERSION = "0.2"
 APP_DIR = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 CONFIG_PATH = APP_DIR / "replay_config.json"
-API_ORDER = ("ASIO", "WASAPI", "WDM-KS", "DirectSound", "MME")
+API_ORDER = ("WASAPI", "WDM-KS", "DirectSound", "MME")
 
 JUMP_SECONDS = 2.0
 ENTER_GUARD_SECONDS = 0.5  # 本線に出した直後は止める操作を無視する
 HEAD_MARGIN_SECONDS = 0.05  # 録音の先端の手前で再生を止める余裕
 STALL_SECONDS = 2.0
 MAX_DATA_BYTES = 4_000_000_000
-BYTES_PER_SAMPLE = 3
+BYTES_PER_SAMPLE = 2  # 16bit
 
 LIVE, SEARCH, ONLINE = "live", "search", "online"
 
@@ -54,8 +50,9 @@ DEFAULT_CONFIG = {
     "input_channel": 1,
     "main_channel": 1,
     "cue_channel": 2,
-    "latency": "low",
-    "down_offset": 0.0,
+    "latency": "high",
+    "exclusive": True,
+    "mark_offset": 2.0,
     "save_dir": str(APP_DIR / "録音"),
 }
 
@@ -76,9 +73,14 @@ def fmt_clock(frames, rate):
     return f"{h:02d}:{m:02d}:{s:05.2f}"
 
 
+def to_int16(samples):
+    scaled = np.round(np.asarray(samples, dtype=np.float64) * 32768.0)
+    return np.clip(scaled, -32768, 32767).astype(np.int16)
+
+
 # ------------------------------------------------------------ 録音データ -------
 class Timeline:
-    """録音全体をメモリに持つ。書き込みはオーディオスレッドのみ。"""
+    """録音全体を16bitでメモリに持つ。書き込みはオーディオスレッドのみ。"""
 
     def __init__(self, rate):
         self.rate = rate
@@ -92,17 +94,19 @@ class Timeline:
         """オーディオスレッドで確保せずに済むよう、画面スレッドから先に確保しておく。"""
         need = self.head // self.chunk + 1 + spare
         while len(self.chunks) < need:
-            a = np.empty(self.chunk, dtype=np.float32)
+            a = np.empty(self.chunk, dtype=np.int16)
             a.fill(0)
             self.chunks.append(a)
 
     def write(self, x):
+        if x.dtype != np.int16:
+            x = to_int16(x)
         h = self.head
         i, n = 0, len(x)
         while i < n:
             c, o = divmod(h + i, self.chunk)
             if c >= len(self.chunks):
-                self.chunks.append(np.zeros(self.chunk, dtype=np.float32))
+                self.chunks.append(np.zeros(self.chunk, dtype=np.int16))
             k = min(n - i, self.chunk - o)
             self.chunks[c][o:o + k] = x[i:i + k]
             i += k
@@ -120,7 +124,7 @@ class Timeline:
             k = min(total - i, self.chunk - o)
             out[i:i + k] = self.chunks[c][o:o + k]
             i += k
-        return out
+        return out / 32768.0
 
     def read_padded(self, start, n):
         """範囲外は無音で埋めて、必ず n サンプル返す。"""
@@ -218,12 +222,6 @@ def wav_header(rate, data_bytes):
     )
 
 
-def to_pcm24(samples):
-    scaled = np.round(np.asarray(samples, dtype=np.float64) * 8388608.0)
-    ints = np.clip(scaled, -8388608, 8388607).astype("<i4")
-    return ints.view(np.uint8).reshape(-1, 4)[:, :3].tobytes()
-
-
 class DiskWriter:
     """番組全体を1つのWAVに保存する。録音を止めて再開しても同じファイルにつながる。"""
 
@@ -266,7 +264,7 @@ class DiskWriter:
                 if item is None:
                     break
                 if item is not False and self.error is None:
-                    data = to_pcm24(item)
+                    data = item.astype("<i2").tobytes()
                     if written + len(data) > MAX_DATA_BYTES:
                         self.error = "ファイルの上限に達したため保存を止めました（聞き返しは続けられます）"
                     else:
@@ -506,6 +504,7 @@ class Engine:
         self.last_in = 0.0
         self.last_out = 0.0
         self.has_stream = False
+        self.exclusive_failed = False
 
     def set_rate(self, rate):
         """録音がまだ空のときだけ呼ぶ。"""
@@ -526,11 +525,11 @@ class Engine:
             if peak > self.peak_in:
                 self.peak_in = peak
         if self.recording:
-            copy = x.copy()
+            ints = to_int16(x)
             writer = self.writer
             if writer is not None:
-                writer.push(copy)
-            self.timeline.write(copy)
+                writer.push(ints)
+            self.timeline.write(ints)
 
     def _on_output(self, outdata, frames, status):
         self.last_out = time.monotonic()
@@ -607,21 +606,35 @@ class Engine:
         n_out = max(self.main_channel, self.cue_channel) + 1
         common = dict(samplerate=self.rate, dtype="float32", latency=cfg["latency"])
         self.last_in = self.last_out = time.monotonic()
-        try:
-            if in_dev == out_dev:
-                self.streams = [sd.Stream(device=(in_dev, out_dev), channels=(n_in, n_out),
-                                          callback=self._duplex, **common)]
-            else:
-                self.streams = [
-                    sd.InputStream(device=in_dev, channels=n_in, callback=self._input_only, **common),
-                    sd.OutputStream(device=out_dev, channels=n_out, callback=self._output_only, **common),
-                ]
-            for s in self.streams:
-                s.start()
-        except Exception:
-            self.close()
-            raise
-        self.has_stream = True
+        self.exclusive_failed = False
+        # WASAPIは排他モードで開いて、通知音などが出力に混ざらないようにする
+        exclusive = bool(cfg.get("exclusive", True)) and str(cfg["output_device"]).startswith("[WASAPI]")
+        attempts = [True, False] if exclusive else [False]
+        for use_exclusive in attempts:
+            try:
+                self._start_streams(in_dev, out_dev, n_in, n_out, common, use_exclusive)
+                self.has_stream = True
+                return
+            except Exception:
+                self.close()
+                if use_exclusive:
+                    self.exclusive_failed = True
+                    continue
+                raise
+
+    def _start_streams(self, in_dev, out_dev, n_in, n_out, common, use_exclusive):
+        settings = sd.WasapiSettings(exclusive=True) if use_exclusive else None
+        if in_dev == out_dev:
+            self.streams = [sd.Stream(device=(in_dev, out_dev), channels=(n_in, n_out), callback=self._duplex,
+                                      extra_settings=(None, settings), **common)]
+        else:
+            self.streams = [
+                sd.InputStream(device=in_dev, channels=n_in, callback=self._input_only, **common),
+                sd.OutputStream(device=out_dev, channels=n_out, callback=self._output_only,
+                                extra_settings=settings, **common),
+            ]
+        for s in self.streams:
+            s.start()
 
     def close(self):
         for s in self.streams:
@@ -749,205 +762,430 @@ def tune_windows():
 
 
 # -------------------------------------------------------------- 画面 -------
-BG = "#14171c"
-PANEL = "#1f242c"
-TEXT = "#eef1f5"
-MUTED = "#98a2b0"
-LINE = "#343b46"
-RED = "#e5343f"
-GREEN = "#2fbf71"
-AMBER = "#e6a817"
+BG = "#e4e9f0"
+PANEL = "#f5f7fa"
+RAISED = "#ffffff"
+LINE = "#aab4c2"
+TEXT = "#1b2430"
+MUTED = "#4c5868"
+WAVE_BG = "#ffffff"
+EMPTY_BG = "#d4dbe5"
+RULER_BG = "#c8d1dd"
+GRID = "#e8edf3"
+WAVE = "#1f5fd0"
+MARK = "#c75f00"
+HEAD = "#5f6b7a"
+SEG_OFF = "#d4dbe5"
+SEG_A = "#0f7f8c"
+SEG_B = "#c58a12"
+SEG_C = "#c23d2b"
+RED = "#cf2a35"
+RED_TEXT = "#b3202b"
+GREEN = "#1a7f46"
 YELLOW = "#f2d13c"
-WAVE = "#6ea8ff"
-WAVE_BG = "#0c0e11"
-EMPTY_BG = "#191c22"
-RULER_BG = "#262c35"
-RULER_H = 28
+YELLOW_TEXT = "#241d00"
+CUE_LINE = "#a87f00"
+LCD = "#0d0f0e"
+LCD_TEXT = "#f2a93b"
+LED_OK = "#18805f"
+NOTICE = "#7a5a00"
+RULER_H = 30
 
 
-class Meter(tk.Canvas):
-    def __init__(self, parent, height=14):
-        super().__init__(parent, height=height, bg=WAVE_BG, highlightthickness=0)
+def round_rect(canvas, x0, y0, x1, y1, r, **kw):
+    r = max(0.0, min(r, (x1 - x0) / 2, (y1 - y0) / 2))
+    pts = (x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1,
+           x1 - r, y1, x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0)
+    return canvas.create_polygon(pts, smooth=True, splinesteps=12, **kw)
+
+
+class RoundPanel(tk.Canvas):
+    def __init__(self, app, parent, fill=PANEL, pad=12, radius=14, parent_bg=BG, fit_width=False, outline=""):
+        super().__init__(parent, bg=parent_bg, highlightthickness=0, takefocus=0)
+        self.pad = app.px(pad)
+        self.radius = app.px(radius)
+        self.fill = fill
+        self.outline = outline
+        self.fit_width = fit_width
+        self.inner = tk.Frame(self, bg=fill)
+        self.window = self.create_window(self.pad, self.pad, anchor="nw", window=self.inner)
+        self.bind("<Configure>", self._layout)
+        self.inner.bind("<Configure>", self._fit)
+
+    def _fit(self, _event=None):
+        need = self.inner.winfo_reqheight() + 2 * self.pad
+        if int(self.cget("height")) != need:
+            self.configure(height=need)
+        if self.fit_width:
+            need_w = self.inner.winfo_reqwidth() + 2 * self.pad
+            if int(self.cget("width")) != need_w:
+                self.configure(width=need_w)
+
+    def _layout(self, _event=None):
+        w, h = self.winfo_width(), self.winfo_height()
+        self.delete("bg")
+        round_rect(self, 1, 1, w - 2, h - 2, self.radius, fill=self.fill, outline=self.outline, tags="bg")
+        self.tag_lower("bg")
+        self.itemconfigure(self.window, width=max(1, w - 2 * self.pad), height=max(1, h - 2 * self.pad))
+
+
+class RoundButton(tk.Canvas):
+    def __init__(self, app, parent, text="", on_click=None, height=44, radius=22, font=None, width=None,
+                 parent_bg=BG, fill=RAISED, outline=LINE, fg=TEXT):
+        super().__init__(parent, height=app.px(height), bg=parent_bg, highlightthickness=0, takefocus=0, cursor="hand2")
+        if width:
+            self.configure(width=app.px(width))
+        self.app = app
+        self.text = text
+        self.radius = app.px(radius)
+        self.font = font or app.f_small
+        self.fill = fill
+        self.outline = outline
+        self.fg = fg
+        self.on_click = on_click
+        self.enabled = True
+        self.bind("<Configure>", lambda _e: self.redraw())
+        self.bind("<ButtonRelease-1>", self._release)
+
+    def _release(self, _event):
+        if self.enabled and self.on_click:
+            self.on_click()
+
+    def set_style(self, fill=None, outline=None, fg=None, text=None, enabled=None):
+        changed = False
+        for name, value in (("fill", fill), ("outline", outline), ("fg", fg), ("text", text), ("enabled", enabled)):
+            if value is not None and getattr(self, name) != value:
+                setattr(self, name, value)
+                changed = True
+        if changed:
+            self.redraw()
+
+    def redraw(self):
+        self.delete("all")
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 4 or h < 4:
+            return
+        round_rect(self, 1, 1, w - 2, h - 2, self.radius, fill=self.fill, outline=self.outline)
+        self.create_text(w / 2, h / 2, text=self.text, fill=self.fg, font=self.font)
+
+
+class KeyCap(tk.Canvas):
+    def __init__(self, app, parent, text, width=80, height=40, color=TEXT, border=2, font=None, parent_bg=PANEL, radius=9):
+        super().__init__(parent, width=app.px(width), height=app.px(height), bg=parent_bg, highlightthickness=0, takefocus=0)
+        w, h = app.px(width), app.px(height)
+        round_rect(self, 1, 1, w - 2, h - 2, app.px(radius), fill=RAISED, outline=color, width=app.px(border))
+        self.create_text(w / 2, h / 2, text=text, fill=color, font=font or app.f_key)
+
+
+class SegmentMeter(tk.Canvas):
+    COUNT = 32
+
+    def __init__(self, app, parent):
+        super().__init__(parent, height=app.px(10), bg=PANEL, highlightthickness=0, takefocus=0)
+        self.app = app
         self.value = 0.0
+        self.items = []
+        self.lit = -1
+        self.bind("<Configure>", lambda _e: self.build())
+
+    def build(self):
+        self.delete("all")
+        self.items = []
+        w, h = self.winfo_width(), self.winfo_height()
+        gap = self.app.px(3)
+        seg = (w - gap * (self.COUNT - 1)) / self.COUNT
+        for i in range(self.COUNT):
+            x = i * (seg + gap)
+            self.items.append(round_rect(self, x, 0, x + seg, h, h / 2, fill=SEG_OFF, outline=""))
+        self.lit = -1
 
     def set(self, peak):
         db = 20 * np.log10(peak) if peak > 1e-6 else -120.0
         target = min(1.0, max(0.0, (db + 60) / 60))
         self.value = target if target > self.value else max(target, self.value - 0.03)
-        w, h = self.winfo_width(), self.winfo_height()
-        self.delete("all")
-        x = int(w * self.value)
-        for start, end, color in ((0.0, 0.70, GREEN), (0.70, 0.90, AMBER), (0.90, 1.0, RED)):
-            a, b = int(w * start), min(x, int(w * end))
-            if b > a:
-                self.create_rectangle(a, 0, b, h, fill=color, width=0)
+        lit = int(round(self.value * self.COUNT))
+        if lit == self.lit or not self.items:
+            return
+        for i, item in enumerate(self.items):
+            zone = SEG_A if i < 22 else SEG_B if i < 28 else SEG_C
+            self.itemconfigure(item, fill=zone if i < lit else SEG_OFF)
+        self.lit = lit
 
 
 class App:
     def __init__(self, root):
         self.root = root
+        self.scale = max(1.0, root.winfo_fpixels("1i") / 96)
         self.cfg = load_config()
         self.engine = Engine(int(self.cfg["samplerate"]))
         self.peaks = Peaks(self.engine.timeline)
         self.mode = LIVE
         self.marks = []
         self.marks_file = None
-        self.spp = float(self.engine.rate * 30 / 900)  # 表示は約30秒から
+        self.current_mark = None
+        self.spp = float(self.engine.rate * 30 / 900)
         self.v_gain = 1.0
         self.free_view = None
         self.online_started = 0.0
         self.down = set()
+        self.shift_held = False
         self.notice = ""
         self.notice_until = 0.0
         self.engine_error = ""
         self.tick_count = 0
-        self.dialog_open = False
+        self.settings_open = False
+        self.settings_view = None
+        self.band_state = None
 
         families = set(tkfont.families())
         family = next((f for f in ("Yu Gothic UI", "Meiryo UI", "Noto Sans CJK JP") if f in families), "TkDefaultFont")
         mono = next((f for f in ("Consolas", "DejaVu Sans Mono") if f in families), family)
-        self.f_mode = (family, 22, "bold")
-        self.f_clock = (mono, 26, "bold")
-        self.f_mid = (family, 13, "bold")
-        self.f_body = (family, 11)
-        self.f_small = (family, 10)
-        self.f_ruler = (mono, 9)
+        self.f_title = (family, -self.px(20), "bold")
+        self.f_band = (family, -self.px(34), "bold")
+        self.f_clock = (mono, -self.px(54), "bold")
+        self.f_guide = (family, -self.px(19), "bold")
+        self.f_key = (mono, -self.px(16), "bold")
+        self.f_enter = (mono, -self.px(24), "bold")
+        self.f_mid = (family, -self.px(17), "bold")
+        self.f_body = (family, -self.px(14))
+        self.f_small = (family, -self.px(13))
+        self.f_mono = (mono, -self.px(12))
+        self.f_mono_big = (mono, -self.px(18))
+        self.f_speed = (mono, -self.px(18), "bold")
 
-        root.title(f"{APP_NAME} {VERSION}")
+        root.title(f"REPLAY {VERSION}")
         root.configure(bg=BG)
-        root.geometry("1100x660")
-        root.minsize(900, 560)
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        root.geometry(f"{min(self.px(1320), sw - 40)}x{min(self.px(860), sh - 90)}")
+        root.minsize(self.px(1000), min(self.px(680), sh - 90))
+        if sys.platform == "win32":
+            try:
+                root.state("zoomed")  # 全画面での使用が基本
+            except tk.TclError:
+                pass
         root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.build()
+        self.build_style()
+        self.main_view = tk.Frame(root, bg=BG)
+        self.build(self.main_view)
+        self.main_view.pack(fill="both", expand=True, padx=self.px(16), pady=self.px(12))
         root.bind("<KeyPress>", self.on_key)
         root.bind("<KeyRelease>", self.on_key_release)
         root.bind("<FocusOut>", self.on_focus_out)
+        root.bind("<MouseWheel>", self.on_wheel)
+        root.bind("<Button-4>", lambda e: self.on_wheel(e, 120))
+        root.bind("<Button-5>", lambda e: self.on_wheel(e, -120))
         self.start_audio(first_run=True)
         root.focus_force()
         self.tick()
 
-    # ---- 組み立て ----
-    def build(self):
+    def px(self, n):
+        return int(round(n * getattr(self, "scale", 1.0)))
+
+    def build_style(self):
         style = ttk.Style(self.root)
         style.theme_use("clam")
+        style.configure("Horizontal.TScale", background=PANEL, troughcolor=SEG_OFF, bordercolor=LINE, lightcolor=PANEL, darkcolor=LINE)
+        style.configure("Light.TCombobox", fieldbackground=RAISED, background=PANEL, foreground=TEXT, arrowcolor=TEXT,
+                        bordercolor=LINE, lightcolor=LINE, darkcolor=LINE, padding=self.px(8))
+        style.map("Light.TCombobox", fieldbackground=[("readonly", RAISED)], foreground=[("readonly", TEXT)],
+                  selectbackground=[("readonly", RAISED)], selectforeground=[("readonly", TEXT)])
+        self.root.option_add("*TCombobox*Listbox.background", RAISED)
+        self.root.option_add("*TCombobox*Listbox.foreground", TEXT)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", WAVE)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
 
-        top = tk.Frame(self.root, bg=PANEL, padx=12, pady=6)
-        top.pack(fill="x")
-        tk.Label(top, text="検聴の速度", font=self.f_small, fg=MUTED, bg=PANEL).pack(side="left")
+    # ---- 組み立て ----
+    def build(self, parent):
+        px = self.px
+        header = tk.Frame(parent, bg=BG)
+        header.pack(fill="x", pady=(0, px(10)))
+        logo = tk.Canvas(header, width=px(30), height=px(30), bg=BG, highlightthickness=0)
+        logo.create_oval(1, 1, px(29), px(29), fill=RAISED, outline=LINE)
+        logo.create_arc(px(9), px(9), px(21), px(21), start=30, extent=300, style="arc", outline=WAVE, width=px(2))
+        logo.create_line(px(16), px(6), px(20), px(10), px(15), px(12), fill=WAVE, width=px(2))
+        logo.pack(side="left", padx=(0, px(10)))
+        tk.Label(header, text="REPLAY", font=self.f_title, fg=TEXT, bg=BG).pack(side="left")
+        self.not_active = tk.Canvas(header, width=px(102), height=px(26), bg=BG, highlightthickness=0)
+        round_rect(self.not_active, 1, 1, px(100), px(24), px(12), fill=YELLOW, outline="")
+        self.not_active.create_text(px(51), px(13), text="NOT ACTIVE", fill=YELLOW_TEXT, font=self.f_mono)
+        self.not_active_shown = False
+        self.settings_button = RoundButton(self, header, text="設定", on_click=self.open_settings, width=88)
+        self.settings_button.pack(side="right")
+        self.reconnect_button = RoundButton(self, header, text="RECONNECT", on_click=self.reconnect, width=116)
+        self.reconnect_shown = False
+        self.status = tk.Label(header, text="", font=self.f_small, fg=MUTED, bg=BG, anchor="e")
+        self.status.pack(side="right", padx=px(14), fill="x", expand=True)
+
+        guide_panel = RoundPanel(self, parent, pad=12)
+        guide_panel.pack(fill="x")
+        guide = guide_panel.inner
+        keys = tk.Frame(guide, bg=PANEL)
+        keys.pack(side="left", fill="x", expand=True)
+        rows = ((("A–Z", "マーク"), ("↓", "前のマーク"), ("↑", "次のマーク"), ("ESC", "先端に戻る")),
+                (("← →", "2秒"), ("SPACE", "再生 / 止める"), ("SHIFT", "押す間 等倍")))
+        for c in range(4):
+            keys.columnconfigure(c, weight=1, uniform="guide")
+        for r, row in enumerate(rows):
+            for c, (key, text) in enumerate(row):
+                cell = tk.Frame(keys, bg=PANEL)
+                cell.grid(row=r, column=c, sticky="w", pady=px(4))
+                KeyCap(self, cell, key).pack(side="left", padx=(0, px(10)))
+                tk.Label(cell, text=text, font=self.f_guide, fg=TEXT, bg=PANEL).pack(side="left")
+        enter = tk.Frame(guide, bg=PANEL)
+        enter.pack(side="right", padx=(px(20), px(4)))
+        KeyCap(self, enter, "ENTER", width=190, height=58, color=RED_TEXT, border=3, font=self.f_enter, radius=12).pack()
+        tk.Label(enter, text="ONLINE PLAY / STOP", font=self.f_guide, fg=RED_TEXT, bg=PANEL).pack(pady=(px(4), 0))
+
+        self.band = tk.Canvas(parent, height=px(70), bg=BG, highlightthickness=0, takefocus=0)
+        self.band.pack(fill="x", pady=px(10))
+        self.band.bind("<Configure>", lambda _e: self.draw_band(force=True))
+
+        row = tk.Frame(parent, bg=BG)
+        row.pack(fill="x", pady=(0, px(10)))
+        row.columnconfigure(1, weight=1, uniform="info")
+        row.columnconfigure(2, weight=1, uniform="info")
+        clock = RoundPanel(self, row, fill=LCD, pad=10, fit_width=True)
+        clock.grid(row=0, column=0, sticky="ns", padx=(0, px(10)))
+        tk.Label(clock.inner, text="POSITION", font=self.f_mono, fg="#c2c0b9", bg=LCD).pack(anchor="w", padx=px(10))
+        self.pos_label = tk.Label(clock.inner, text="00:00:00.00", font=self.f_clock, fg=LCD_TEXT, bg=LCD)
+        self.pos_label.pack(padx=px(10))
+
+        speed = RoundPanel(self, row, pad=12)
+        speed.grid(row=0, column=1, sticky="nsew", padx=(0, px(10)))
+        line = tk.Frame(speed.inner, bg=PANEL)
+        line.pack(fill="x", expand=True)
+        tk.Label(line, text="CUE SPEED", font=self.f_mono, fg=MUTED, bg=PANEL).pack(side="left")
         self.v_speed = tk.DoubleVar(value=1.5)
-        self.speed_scale = ttk.Scale(top, from_=1.0, to=2.0, variable=self.v_speed, length=260,
-                                     takefocus=0, command=self.on_speed)
-        self.speed_scale.pack(side="left", padx=8)
-        self.speed_label = tk.Label(top, text="1.5 倍", font=self.f_mid, fg=TEXT, bg=PANEL, width=6)
+        self.speed_scale = ttk.Scale(line, from_=1.0, to=2.0, variable=self.v_speed, takefocus=0, command=self.on_speed)
+        self.speed_scale.pack(side="left", fill="x", expand=True, padx=px(10))
+        self.speed_label = tk.Label(line, text="1.5×", font=self.f_speed, fg=TEXT, bg=PANEL, width=4)
         self.speed_label.pack(side="left")
         self.v_keep_pitch = tk.BooleanVar(value=True)
-        self.pitch_button = tk.Checkbutton(top, text="声の高さを保つ", variable=self.v_keep_pitch, font=self.f_small,
-                                           fg=TEXT, bg=PANEL, selectcolor="#0c0e11", activebackground=PANEL,
-                                           activeforeground=TEXT, takefocus=0, command=self.on_pitch)
-        self.pitch_button.pack(side="left", padx=(16, 0))
-        self.settings_button = tk.Button(top, text="設定", font=self.f_small, fg=TEXT, bg="#2a303a",
-                                         activebackground="#3a424e", activeforeground=TEXT, relief="flat", padx=12,
-                                         takefocus=0, command=self.open_settings)
-        self.settings_button.pack(side="right")
-        self.reconnect_button = tk.Button(top, text="再接続", font=self.f_small, fg=TEXT, bg="#2a303a",
-                                          activebackground="#3a424e", activeforeground=TEXT, relief="flat", padx=12,
-                                          takefocus=0, command=self.reconnect)
-        self.reconnect_button.pack(side="right", padx=(0, 6))
+        self.pitch_button = tk.Checkbutton(speed.inner, text="KEEP PITCH", variable=self.v_keep_pitch, font=self.f_mono, fg=MUTED,
+                                           bg=PANEL, activebackground=PANEL, activeforeground=TEXT, selectcolor=RAISED, takefocus=0,
+                                           highlightthickness=0, command=self.on_pitch)
+        self.pitch_button.pack(anchor="w")
 
-        self.banner = tk.Label(self.root, text="", font=self.f_mode, fg="#ffffff", bg=BG, pady=4)
-        self.banner.pack(fill="x")
+        devices = RoundPanel(self, row, pad=12)
+        devices.grid(row=0, column=2, sticky="nsew")
+        self.device_rows = {}
+        for key, title in (("in", "INPUT"), ("out", "OUTPUT")):
+            line = tk.Frame(devices.inner, bg=PANEL)
+            line.pack(fill="x", expand=True, pady=px(3))
+            led = tk.Canvas(line, width=px(10), height=px(10), bg=PANEL, highlightthickness=0)
+            item = led.create_oval(0, 0, px(9), px(9), fill=LED_OK, outline="")
+            led.pack(side="left", padx=(0, px(10)))
+            tk.Label(line, text=title, font=self.f_mono, fg=MUTED, bg=PANEL, width=7, anchor="w").pack(side="left")
+            name = tk.Label(line, text="", font=self.f_body, fg=TEXT, bg=PANEL, anchor="w")
+            name.pack(side="left", fill="x", expand=True)
+            self.device_rows[key] = (led, item, name)
 
-        self.hint = tk.Label(self.root, text="", font=self.f_body, fg=MUTED, bg=BG, anchor="w", padx=12, pady=6)
-        self.hint.pack(side="bottom", fill="x")
-        self.status = tk.Label(self.root, text="", font=self.f_small, fg=MUTED, bg=BG, anchor="w", padx=12)
-        self.status.pack(side="bottom", fill="x")
-
-        panel = tk.Frame(self.root, bg=PANEL, padx=12, pady=8)
-        panel.pack(side="bottom", fill="x", padx=12, pady=(8, 2))
-        panel.columnconfigure(3, weight=1)
-        self.rec_button = tk.Button(panel, text="●  録音開始", font=self.f_mid, fg="#ffffff", bg="#3a424e",
-                                    activebackground="#4a5360", activeforeground="#ffffff",
-                                    disabledforeground="#6d7683", relief="flat", width=12, takefocus=0,
-                                    command=self.toggle_record)
-        self.rec_button.grid(row=0, column=0, rowspan=2, ipady=8, padx=(0, 16))
-        tk.Label(panel, text="現在位置", font=self.f_small, fg=MUTED, bg=PANEL).grid(row=0, column=1, sticky="w")
-        self.pos_label = tk.Label(panel, text="00:00:00.00", font=self.f_clock, fg=YELLOW, bg="#000000", padx=8)
-        self.pos_label.grid(row=1, column=1, padx=(0, 12))
-        tk.Label(panel, text="録音の長さ", font=self.f_small, fg=MUTED, bg=PANEL).grid(row=0, column=2, sticky="w")
-        self.head_label = tk.Label(panel, text="00:00:00.00", font=self.f_clock, fg=YELLOW, bg="#000000", padx=8)
-        self.head_label.grid(row=1, column=2, padx=(0, 16))
-        meters = tk.Frame(panel, bg=PANEL)
-        meters.grid(row=0, column=3, rowspan=2, sticky="ew")
-        meters.columnconfigure(1, weight=1)
+        bottom = tk.Frame(parent, bg=BG)
+        bottom.pack(side="bottom", fill="x", pady=(px(10), 0))
+        bottom.columnconfigure(2, weight=1)
+        self.rec_button = RoundButton(self, bottom, text="●  REC START", on_click=self.toggle_record, width=190, height=76, radius=14, font=self.f_mid)
+        self.rec_button.grid(row=0, column=0, sticky="ns", padx=(0, px(10)))
+        info = RoundPanel(self, bottom, pad=10, fit_width=True)
+        info.grid(row=0, column=1, sticky="ns", padx=(0, px(10)))
+        length = tk.Frame(info.inner, bg=PANEL)
+        length.pack(side="left", padx=(px(8), px(18)))
+        tk.Label(length, text="LENGTH", font=self.f_mono, fg=MUTED, bg=PANEL).pack(anchor="w")
+        self.head_label = tk.Label(length, text="00:00:00", font=self.f_mono_big, fg=MUTED, bg=PANEL)
+        self.head_label.pack(anchor="w")
+        marks = tk.Frame(info.inner, bg=PANEL)
+        marks.pack(side="left", padx=(0, px(8)))
+        tk.Label(marks, text="MARKS", font=self.f_mono, fg=MUTED, bg=PANEL).pack(anchor="w")
+        self.marks_label = tk.Label(marks, text="0", font=self.f_mono_big, fg=TEXT, bg=PANEL)
+        self.marks_label.pack(anchor="w")
+        meters_panel = RoundPanel(self, bottom, pad=12)
+        meters_panel.grid(row=0, column=2, sticky="nsew")
+        meters_panel.inner.columnconfigure(1, weight=1)
         self.meters = {}
-        for i, (key, text) in enumerate((("in", "入力"), ("main", "本線 L"), ("cue", "検聴 R"))):
-            tk.Label(meters, text=text, font=self.f_small, fg=MUTED, bg=PANEL).grid(row=i, column=0, sticky="w", padx=(0, 8), pady=2)
-            m = Meter(meters)
-            m.grid(row=i, column=1, sticky="ew", pady=2)
+        for i, (key, text) in enumerate((("in", "INPUT"), ("main", "MAIN L"), ("cue", "CUE R"))):
+            tk.Label(meters_panel.inner, text=text, font=self.f_mono, fg=MUTED, bg=PANEL, width=7, anchor="w").grid(row=i, column=0, padx=(0, px(10)), pady=px(2))
+            m = SegmentMeter(self, meters_panel.inner)
+            m.grid(row=i, column=1, sticky="ew")
             self.meters[key] = m
 
-        self.wave = tk.Canvas(self.root, bg=WAVE_BG, highlightthickness=0)
-        self.wave.pack(fill="both", expand=True, padx=12)
+        self.wave = tk.Canvas(parent, bg=WAVE_BG, highlightthickness=0, height=px(240), takefocus=0)
+        self.wave.pack(fill="both", expand=True)
         self.wave.bind("<Button-1>", self.on_wave_click)
-        # ホイールはウィンドウ全体で受けて、マウスが波形の上にあるときだけ反応する
-        self.root.bind("<MouseWheel>", self.on_wheel)
-        self.root.bind("<Button-4>", lambda e: self.on_wheel(e, 120))
-        self.root.bind("<Button-5>", lambda e: self.on_wheel(e, -120))
 
     # ---- オーディオ起動 ----
     def start_audio(self, first_run=False):
         if not self.cfg["input_device"] or not self.cfg["output_device"]:
-            self.engine_error = "デバイスが未設定です。「設定」から選んでください"
+            self.engine_error = "SELECT A デバイス IN 設定"
             if first_run:
-                self.root.after(300, self.open_settings)
+                self.root.after(200, self.open_settings)
             return
         try:
             self.engine.open(self.cfg)
             self.engine_error = ""
+            if self.cfg.get("exclusive") and self.engine.exclusive_failed:
+                self.show_notice("EXCLUSIVE NOT AVAILABLE. WINDOWS SOUNDS MAY MIX IN", 8.0)
         except Exception as e:
             log_exception()
-            self.engine_error = f"オーディオを開けません: {e}"
+            self.engine_error = f"CANNOT OPEN AUDIO: {e}"
 
     def reconnect(self):
         if self.mode == ONLINE or self.engine.recording:
-            self.show_notice("録音を止めてから再接続してください")
+            self.show_notice("STOP RECORDING FIRST")
             return
         self.leave_search()
         self.engine.close()
         rescan_devices()
         self.start_audio()
+        self.root.focus_set()
 
     def open_settings(self):
         if self.mode == ONLINE or self.engine.recording:
-            self.show_notice("録音を止めてから設定を開いてください")
+            self.show_notice("STOP RECORDING FIRST")
             return
-        if self.dialog_open:
+        if self.settings_open:
             return
         self.leave_search()
         self.engine.close()
         rescan_devices()
-        SettingsDialog(self)
+        self.settings_open = True
+        self.main_view.pack_forget()
+        self.settings_view = SettingsView(self)
+        self.settings_view.pack(fill="both", expand=True, padx=self.px(16), pady=self.px(12))
+        self.root.focus_set()
 
-    def apply_settings(self, cfg):
-        rate = int(cfg["samplerate"])
-        if rate != self.engine.rate and self.engine.timeline.head == 0 and self.engine.writer is None:
-            self.engine.set_rate(rate)
-            self.peaks = Peaks(self.engine.timeline)
-            self.spp = float(rate * 30 / 900)
-            self.apply_cue_settings()
-        self.cfg = cfg
-        save_config(cfg)
+    def close_settings(self, cfg=None):
+        self.settings_open = False
+        self.settings_view.destroy()
+        self.settings_view = None
+        self.main_view.pack(fill="both", expand=True, padx=self.px(16), pady=self.px(12))
+        if cfg is not None:
+            rate = int(cfg["samplerate"])
+            if rate != self.engine.rate and self.engine.timeline.head == 0 and self.engine.writer is None:
+                self.engine.set_rate(rate)
+                self.peaks = Peaks(self.engine.timeline)
+                self.spp = float(rate * 30 / 900)
+                self.apply_cue_settings()
+            self.cfg = cfg
+            save_config(cfg)
+            if cfg["main_channel"] == cfg["cue_channel"]:
+                self.show_notice("MAIN AND CUE USE THE SAME CHANNEL", 8.0)
         self.start_audio()
+        self.root.focus_force()
+        self.draw_band(force=True)
 
     def apply_cue_settings(self):
-        self.engine.cue.speed = round(float(self.v_speed.get()), 1)
+        self.engine.cue.speed = self.effective_speed()
         self.engine.cue.keep_pitch = bool(self.v_keep_pitch.get())
 
     # ---- 上部 ----
+    def effective_speed(self):
+        return 1.0 if self.shift_held else round(float(self.v_speed.get()), 1)
+
     def on_speed(self, _value=None):
+        if self.mode == ONLINE:
+            return
         speed = round(float(self.v_speed.get()), 1)
-        self.speed_label.configure(text=f"{speed:.1f} 倍")
-        self.engine.cue.speed = speed
+        self.speed_label.configure(text=f"{speed:.1f}×")
+        self.engine.cue.speed = self.effective_speed()
         self.root.focus_set()
 
     def on_pitch(self):
@@ -967,7 +1205,7 @@ class App:
             self.engine.stop_recording()
             return
         if not self.engine.healthy():
-            self.show_notice("オーディオが動いていないため録音できません")
+            self.show_notice("AUDIO IS NOT RUNNING")
             return
         try:
             self.engine.start_recording(self.cfg["save_dir"])
@@ -975,7 +1213,7 @@ class App:
                 self.marks_file = self.engine.writer.path.with_suffix(".marks.txt")
         except OSError as e:
             log_exception()
-            self.show_notice(f"録音を開始できません: {e}", 6.0)
+            self.show_notice(f"CANNOT START RECORDING: {e}", 6.0)
         self.root.focus_set()
 
     # ---- 位置 ----
@@ -990,6 +1228,7 @@ class App:
     def leave_search(self):
         self.engine.cue.stop()
         self.free_view = None
+        self.current_mark = None
         self.mode = LIVE
 
     def clamp(self, pos):
@@ -998,14 +1237,16 @@ class App:
     def play_at(self, pos):
         self.mode = SEARCH
         self.free_view = None
+        self.engine.cue.speed = self.effective_speed()
         self.engine.cue.play_from(self.clamp(pos))
 
     def jump_keep_state(self, pos):
-        """マウスや Shift+矢印の移動。止まっていれば飛ぶだけ、再生中なら飛んだ先から続ける。"""
+        """マウスの移動。止まっていれば飛ぶだけ、再生中なら飛んだ先から続ける。"""
         cue = self.engine.cue
         was_playing = self.mode == SEARCH and cue.playing()
         self.mode = SEARCH
         self.free_view = None
+        self.current_mark = None
         if was_playing:
             cue.play_from(self.clamp(pos))
         else:
@@ -1018,22 +1259,27 @@ class App:
         if len(ks) == 1 and ks.isascii() and ks.isalpha():
             return True
         if sys.platform == "win32" and (65 <= event.keycode <= 90 or event.keycode == 229):
-            return True  # 229 は日本語入力が取ったキー
+            return True
         return False
 
     def on_key(self, event):
+        ks = event.keysym
+        if self.settings_open:
+            if ks == "Escape" and self.settings_view is not None:
+                self.settings_view.back()
+            return
         code = event.keycode
-        if code in self.down:  # 押しっぱなしのリピートには反応しない
+        if code in self.down:
             return
         self.down.add(code)
-        ks = event.keysym
         is_enter = ks in ("Return", "KP_Enter")
         if self.mode == ONLINE:
             if is_enter and time.monotonic() - self.online_started >= ENTER_GUARD_SECONDS:
                 self.engine.stop_online()
             return
-        shift = bool(event.state & 0x0001)
-        if is_enter:
+        if ks in ("Shift_L", "Shift_R"):
+            self.set_shift(True)
+        elif is_enter:
             self.key_enter()
         elif ks == "Escape":
             if self.mode == SEARCH:
@@ -1041,31 +1287,46 @@ class App:
         elif ks == "space":
             self.key_space()
         elif ks == "Down":
-            self.key_down()
+            self.key_mark(-1)
+        elif ks == "Up":
+            self.key_mark(1)
         elif ks == "Left":
-            self.key_mark_jump(-1) if shift else self.key_jump(-1)
+            self.key_jump(-1)
         elif ks == "Right":
-            self.key_mark_jump(1) if shift else self.key_jump(1)
+            self.key_jump(1)
         elif self.is_letter(event):
             self.add_mark()
 
     def on_key_release(self, event):
         self.down.discard(event.keycode)
+        if event.keysym in ("Shift_L", "Shift_R"):
+            self.set_shift(False)
 
     def on_focus_out(self, event):
         if event.widget is self.root:
             self.down.clear()
+            self.set_shift(False)
+
+    def set_shift(self, held):
+        if held == self.shift_held:
+            return
+        self.shift_held = held
+        cue = self.engine.cue
+        cue.speed = self.effective_speed()
+        # すでに作ってある分を捨てて、聞いている位置からすぐ速度を切り替える
+        if self.mode == SEARCH and cue.playing():
+            cue.play_from(cue.position())
 
     def key_enter(self):
-        if self.mode != SEARCH:  # 聞かずに出すことはないので、普段の表示では何もしない
+        if self.mode != SEARCH:  # 聞かずに出すことはないので、先端では何もしない
             return
         if not self.engine.healthy():
-            self.show_notice("オーディオが動いていないため再生できません")
+            self.show_notice("AUDIO IS NOT RUNNING")
             return
         pos = self.position()
         limit = self.engine.timeline.head - int(self.engine.rate * HEAD_MARGIN_SECONDS)
         if pos >= limit:
-            self.show_notice("録音の先端なので出せる音がありません")
+            self.show_notice("NOTHING TO PLAY AT THE LIVE POSITION")
             return
         self.free_view = None
         self.engine.go_online(pos)
@@ -1081,12 +1342,25 @@ class App:
         else:
             self.play_at(cue.position())
 
-    def key_down(self):
+    def key_mark(self, direction):
+        """↓で前のマーク、↑で次のマーク。マークの少し前から検聴する。"""
         if not self.marks:
-            self.show_notice("マークがまだありません")
+            self.show_notice("NO MARKS YET")
             return
-        offset = float(self.cfg.get("down_offset", 0.0)) * self.engine.rate
-        self.play_at(self.marks[-1] - offset)
+        i = self.current_mark
+        if i is None or i >= len(self.marks):
+            pos = self.position()
+            if direction < 0:
+                i = bisect.bisect_right(self.marks, pos) - 1
+            else:
+                i = bisect.bisect_right(self.marks, pos)
+        else:
+            i += direction
+        if not 0 <= i < len(self.marks):
+            return
+        self.current_mark = i
+        offset = float(self.cfg.get("mark_offset", 2.0)) * self.engine.rate
+        self.play_at(self.marks[i] - offset)
 
     def key_jump(self, direction):
         step = int(JUMP_SECONDS * self.engine.rate)
@@ -1094,30 +1368,17 @@ class App:
             return
         if not self.engine.timeline.head:
             return
+        self.current_mark = None
         self.play_at(self.position() + direction * step)
-
-    def key_mark_jump(self, direction):
-        if not self.marks:
-            self.show_notice("マークがまだありません")
-            return
-        pos = self.position()
-        margin = int(self.engine.rate * 0.05)  # 再生中に同じマークへ戻り続けないように
-        if direction < 0:
-            i = bisect.bisect_left(self.marks, pos - margin) - 1
-        else:
-            i = bisect.bisect_right(self.marks, pos + margin)
-        if 0 <= i < len(self.marks):
-            self.jump_keep_state(self.marks[i])
 
     def add_mark(self):
         head = self.engine.timeline.head
         if head == 0:
-            self.show_notice("録音を始めるとマークを打てます")
+            self.show_notice("START RECORDING TO MARK")
             return
         if self.marks and self.marks[-1] == head:
             return
         self.marks.append(head)
-        self.show_notice(f"マーク {len(self.marks)}  ({fmt_clock(head, self.engine.rate)})", 1.5)
         if self.marks_file is not None:
             try:
                 with open(self.marks_file, "a", encoding="utf-8") as f:
@@ -1131,16 +1392,19 @@ class App:
             return self.free_view
         return self.position() - width / 3 * self.spp
 
+    def grid_start(self, width):
+        """画面の左端を、時間で固定した列の境目に揃える。"""
+        return np.floor(self.view_start(width) / self.spp) * self.spp
+
     def on_wave_click(self, event):
-        # 波形の上は何も起きない。目盛りのクリックだけ飛ぶ（BE-200と同じ）
-        if self.mode == ONLINE or event.y > RULER_H or not self.engine.timeline.head:
+        # 波形でもタイムラインでも、叩いた場所に飛ぶ
+        if self.mode == ONLINE or not self.engine.timeline.head:
             return
         width = self.wave.winfo_width()
-        target = self.view_start(width) + event.x * self.spp
-        self.jump_keep_state(target)
+        self.jump_keep_state(self.grid_start(width) + event.x * self.spp)
 
     def on_wheel(self, event, delta=None):
-        if self.mode == ONLINE:
+        if self.mode == ONLINE or self.settings_open:
             return
         mouse_x = self.root.winfo_pointerx() - self.wave.winfo_rootx()
         mouse_y = self.root.winfo_pointery() - self.wave.winfo_rooty()
@@ -1148,17 +1412,16 @@ class App:
             return
         delta = event.delta if delta is None else delta
         up = delta > 0
-        if event.state & 0x0004:  # Ctrl：時間軸
+        if event.state & 0x0004:
             old = self.spp
             new = old / 1.25 if up else old * 1.25
             new = min(max(new, 2.0), self.engine.rate * 3600 * 6 / max(1, self.wave.winfo_width()))
             width = self.wave.winfo_width()
             if self.mode == SEARCH and not self.engine.cue.playing():
-                # 止まっているときはマウスの位置を中心にする
                 t = self.view_start(width) + mouse_x * old
                 self.free_view = t - mouse_x * new
             self.spp = new
-        elif event.state & 0x0001:  # Shift：縦
+        elif event.state & 0x0001:
             self.v_gain = min(64.0, self.v_gain * 1.25) if up else max(1.0, self.v_gain / 1.25)
 
     # ---- 定期更新 ----
@@ -1176,14 +1439,17 @@ class App:
             e.timeline.reserve()
         except MemoryError:
             log_exception()
-            self.show_notice("メモリが不足しています", 5.0)
+            self.show_notice("OUT OF MEMORY", 5.0)
         self.peaks.update()
         if self.mode == ONLINE and not e.online:
             self.mode = SEARCH
             e.cue.locate(e.online_pos)
         if self.free_view is not None and self.mode == SEARCH and e.cue.playing():
             self.free_view = None
+        if self.settings_open:
+            return
         self.draw_wave()
+        self.draw_band()
         self.update_labels()
         self.meters["in"].set(e.peak_in)
         self.meters["main"].set(e.peak_main)
@@ -1191,6 +1457,35 @@ class App:
         e.peak_in = e.peak_main = e.peak_cue = 0.0
         if self.tick_count % 12 == 0:
             self.update_status()
+
+    def band_content(self):
+        e = self.engine
+        if self.mode == ONLINE:
+            return RED, "#ffffff", "ONLINE PLAY", "チャレンジ　検証中"
+        if self.mode == SEARCH:
+            if e.cue.playing():
+                return YELLOW, YELLOW_TEXT, f"CUE　{self.effective_speed():.1f}倍速", ""
+            return YELLOW, YELLOW_TEXT, "STANDBY", ""
+        if e.recording:
+            return GREEN, "#ffffff", "RECORDING", ""
+        return "#5f6b7a", "#ffffff", "STOPPED", ""
+
+    def draw_band(self, force=False):
+        state = self.band_content()
+        if state == self.band_state and not force:
+            return
+        self.band_state = state
+        c = self.band
+        c.delete("all")
+        w, h = c.winfo_width(), c.winfo_height()
+        if w < 10:
+            return
+        fill, fg, center, side = state
+        round_rect(c, 1, 1, w - 2, h - 2, self.px(14), fill=fill, outline="")
+        c.create_text(w / 2, h / 2, text=center, fill=fg, font=self.f_band)
+        if side:
+            c.create_text(w / 6, h / 2, text=side, fill=fg, font=self.f_band)
+            c.create_text(w * 5 / 6, h / 2, text=side, fill=fg, font=self.f_band)
 
     def draw_wave(self):
         c = self.wave
@@ -1201,43 +1496,41 @@ class App:
         rate = e.rate
         c.delete("all")
         spp = self.spp
-        start = self.view_start(w)
-        wave_top = RULER_H
-        wave_h = h - wave_top
-        mid = wave_top + wave_h / 2
+        # 列の境目を時間で固定し、波形はピクセル単位で送る。これで形が揺れない
+        start = self.grid_start(w)
+        ruler = self.px(RULER_H)
+        wave_h = h - ruler
+        mid = ruler + wave_h / 2
         scale = wave_h / 2 * self.v_gain
-        c.create_rectangle(0, 0, w, wave_top, fill=RULER_BG, width=0)
+        c.create_rectangle(0, ruler, w, h, fill=EMPTY_BG, width=0)
         head = e.timeline.head
-        # 録音のない範囲は背景を変える
-        x0 = (0 - start) / spp
-        x1 = (head - start) / spp
-        c.create_rectangle(0, wave_top, w, h, fill=EMPTY_BG, width=0)
+        x0 = int(round((0 - start) / spp))
+        x1 = int(round((head - start) / spp))
         if x1 > 0 and x0 < w:
-            c.create_rectangle(max(0, x0), wave_top, min(w, x1), h, fill=WAVE_BG, width=0)
-        # 目盛り
+            c.create_rectangle(max(0, x0), ruler, min(w, x1), h, fill=WAVE_BG, width=0)
+        c.create_rectangle(0, 0, w, ruler, fill=RULER_BG, width=0)
         seconds_per_px = spp / rate
         step = next((s for s in (0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1200, 1800, 3600, 7200)
-                     if s / seconds_per_px >= 90), 14400)
+                     if s / seconds_per_px >= 110), 14400)
         t = max(0.0, np.floor(start / rate / step) * step)
         while True:
-            x = (t * rate - start) / spp
+            x = int(round((t * rate - start) / spp))
             if x > w:
                 break
             if x >= 0:
-                c.create_line(x, wave_top - 8, x, wave_top, fill=MUTED)
-                c.create_line(x, wave_top, x, h, fill="#1c2027")
-                total = int(round(t * 100))
-                hh, rem = divmod(total, 360000)
-                mm, rem = divmod(rem, 6000)
-                ss = rem / 100
+                c.create_line(x, 0, x, ruler, fill=MUTED)
+                c.create_line(x, ruler, x, h, fill=GRID)
+                total = int(round(t * 10))
+                hh, rem = divmod(total, 36000)
+                mm, rem = divmod(rem, 600)
+                ss = rem / 10
                 text = f"{hh}:{mm:02d}:{ss:02.0f}" if step >= 1 else f"{hh}:{mm:02d}:{ss:04.1f}"
-                c.create_text(x + 3, 2, text=text, anchor="nw", fill=TEXT, font=self.f_ruler)
+                c.create_text(x + self.px(5), self.px(7), text=text, anchor="nw", fill=TEXT, font=self.f_mono)
             t += step
         c.create_line(0, mid, w, mid, fill=LINE)
-        # 波形
         xs, mins, maxs = self.peaks.column_range(start, spp, w)
         if len(xs) >= 2:
-            ytop = np.maximum(mid - maxs * scale, wave_top)
+            ytop = np.maximum(mid - maxs * scale, ruler)
             ybot = np.minimum(mid - mins * scale, h)
             ybot = np.maximum(ybot, ytop + 1)
             coords = np.empty(len(xs) * 4)
@@ -1246,158 +1539,181 @@ class App:
             coords[2::4] = xs
             coords[3::4] = ybot
             c.create_line(coords.tolist(), fill=WAVE)
-        # つなぎ目
         for seam in e.timeline.seams:
-            x = (seam - start) / spp
+            x = int(round((seam - start) / spp))
             if 0 <= x <= w:
-                c.create_line(x, wave_top, x, h, fill="#7d8796", dash=(2, 4))
-        # マーク
+                c.create_line(x, ruler, x, h, fill=HEAD, dash=(2, 4))
         left = bisect.bisect_left(self.marks, start)
         right = bisect.bisect_right(self.marks, start + w * spp)
+        tri = self.px(6)
         for m in self.marks[left:right]:
-            x = (m - start) / spp
-            c.create_line(x, wave_top, x, h, fill=AMBER)
-            c.create_polygon(x - 5, wave_top, x + 5, wave_top, x, wave_top + 8, fill=AMBER, width=0)
-        # カーソル
+            x = int(round((m - start) / spp))
+            c.create_line(x, ruler, x, h, fill=MARK)
+            c.create_polygon(x - tri, ruler, x + tri, ruler, x, ruler + self.px(9), fill=MARK, width=0)
+        if self.mode != LIVE and 0 <= x1 <= w:
+            c.create_line(x1, ruler, x1, h, fill=HEAD)
+            c.create_text(x1 + self.px(6), h - self.px(8), text="LIVE", anchor="sw", fill=MUTED, font=self.f_mono)
         pos = self.position()
-        x = (pos - start) / spp
-        color = {LIVE: "#ffffff", SEARCH: YELLOW, ONLINE: RED}[self.mode]
+        x = int(round((pos - start) / spp))
+        playing = self.mode == SEARCH and e.cue.playing()
+        color = {LIVE: TEXT, SEARCH: CUE_LINE, ONLINE: RED}[self.mode]
         if 0 <= x <= w:
-            c.create_line(x, 0, x, h, fill=color, width=2)
-            if self.mode == SEARCH and not e.cue.playing():
-                c.create_polygon(x - 7, 0, x + 7, 0, x, 12, fill=YELLOW, width=0)
-                c.create_text(x + 9, wave_top + 3, text="STANDBY", anchor="nw", fill=YELLOW, font=self.f_small)
+            c.create_line(x, 0, x, h, fill=color, width=self.px(2))
+            if self.mode == SEARCH and not playing:
+                t8 = self.px(8)
+                c.create_polygon(x - t8, ruler, x + t8, ruler, x, ruler + self.px(12), fill=color, width=0)
+                c.create_text(x + self.px(10), ruler + self.px(6), text="STANDBY", anchor="nw", fill=color, font=self.f_small)
 
     def update_labels(self):
         e = self.engine
         rate = e.rate
         self.pos_label.configure(text=fmt_clock(self.position(), rate))
-        self.head_label.configure(text=fmt_clock(e.timeline.head, rate))
-        if self.mode == ONLINE:
-            text, bg = "ON AIR  本線に出しています", RED
-            hint = "Enter：止める　　（他の操作は受け付けません）"
-        elif self.mode == SEARCH:
-            if e.cue.playing():
-                text, bg = f"検聴中  {e.cue.speed:.1f} 倍", "#1b6b45"
-                hint = "← →：2秒戻す／送る　　Space：止める　　Enter：本線に出す　　Shift+← →：マーク移動　　Esc：やめる"
-            else:
-                text, bg = "スタンバイ", "#7a6410"
-                hint = "Enter：ここから本線に出す　　← →：2秒戻す／送る　　Space：聞く　　Shift+← →：マーク移動　　Esc：やめる"
-        else:
-            if e.recording:
-                text, bg = f"録音中　マーク {len(self.marks)}", BG
-            else:
-                text, bg = f"録音停止中　マーク {len(self.marks)}", "#5a2a10"
-            hint = "アルファベット：マーク　　↓：最後のマークから検聴　　←：2秒戻して検聴"
-        if not self.root_has_focus() and not self.dialog_open:
-            text, bg = "このソフトが選ばれていません（キーが効きません）", RED
-        self.banner.configure(text=text, bg=bg)
-        self.hint.configure(text=hint)
+        head = e.timeline.head / rate
+        self.head_label.configure(text=f"{int(head // 3600):02d}:{int(head % 3600 // 60):02d}:{int(head % 60):02d}")
+        self.marks_label.configure(text=str(len(self.marks)))
         if e.recording:
-            self.rec_button.configure(text="■  録音停止", bg=RED, activebackground="#f25560")
+            self.rec_button.set_style(text="■  REC STOP", fill=RED, outline=RED, fg="#ffffff")
         else:
-            self.rec_button.configure(text="●  録音開始", bg="#3a424e", activebackground="#4a5360")
+            self.rec_button.set_style(text="●  REC START", fill=RAISED, outline=LINE, fg=TEXT)
         online = self.mode == ONLINE
         state = "disabled" if online else "normal"
-        self.rec_button.configure(state=state)
-        self.settings_button.configure(state=state)
-        self.reconnect_button.configure(state=state)
+        self.rec_button.set_style(enabled=not online)
+        self.settings_button.set_style(enabled=not online)
         self.pitch_button.configure(state=state)
         self.speed_scale.configure(state=state)
-        now = time.monotonic()
-        if self.notice and now >= self.notice_until:
+        focused = bool(str(self.root.tk.call("focus"))) if not hasattr(self, "_test_focus") else self._test_focus()
+        if focused == self.not_active_shown:
+            self.not_active_shown = not focused
+            if self.not_active_shown:
+                self.not_active.pack(side="left", padx=self.px(12))
+            else:
+                self.not_active.pack_forget()
+        if self.notice and time.monotonic() >= self.notice_until:
             self.notice = ""
-
-    def root_has_focus(self):
-        # focus コマンドは、このソフトにフォーカスがなければ空を返す
-        return bool(str(self.root.tk.call("focus")))
 
     def update_status(self):
         e = self.engine
+        ok = e.healthy()
+        for key, cfg_key in (("in", "input_device"), ("out", "output_device")):
+            led, item, name = self.device_rows[key]
+            led.itemconfigure(item, fill=LED_OK if ok else RED)
+            name.configure(text=short_device(self.cfg[cfg_key]) or "—")
+        if ok == self.reconnect_shown:
+            self.reconnect_shown = not ok
+            if self.reconnect_shown:
+                self.reconnect_button.pack(side="right", padx=(0, self.px(8)), before=self.settings_button)
+            else:
+                self.reconnect_button.pack_forget()
         color = MUTED
         if self.notice:
-            text, color = self.notice, AMBER
+            text, color = self.notice, NOTICE
         elif e.writer is not None and e.writer.error:
-            text, color = e.writer.error, RED
-        elif not e.healthy():
-            text = self.engine_error or "オーディオが止まっています。機器を確認して「再接続」を押してください"
-            color = RED
+            text, color = e.writer.error, RED_TEXT
+        elif not ok:
+            text, color = (self.engine_error or "AUDIO STOPPED"), RED_TEXT
         else:
-            text = f"{self.cfg['input_device']}  →  {self.cfg['output_device']}  /  {e.rate / 1000:g} kHz"
-            used = len(e.timeline.chunks) * e.timeline.chunk * 4 / 1e9
-            text += f"  /  メモリ {used:.1f} GB"
+            used = len(e.timeline.chunks) * e.timeline.chunk * 2 / 1e9
+            text = f"MEMORY {used:.1f} GB"
             try:
                 free = shutil.disk_usage(Path(self.cfg["save_dir"]).anchor or ".").free
-                text += f"  /  ディスク空き {free / 1e9:.0f} GB"
+                text += f"   DISK {free / 1e9:.0f} GB"
                 if free < 2e9:
-                    color = AMBER
+                    color = NOTICE
             except OSError:
                 pass
             if e.problems:
-                text += f"  /  音声の取りこぼし {e.problems} 回"
-                color = AMBER
+                text += f"   DROPOUTS {e.problems}"
+                color = NOTICE
         self.status.configure(text=text, fg=color)
 
     def on_close(self):
         if self.mode == ONLINE:
-            self.show_notice("本線に出している間は終了できません。Enterで止めてください")
+            self.show_notice("PRESS ENTER TO STOP BEFORE CLOSING")
             return
-        if self.engine.recording and not messagebox.askokcancel(APP_NAME, "録音中です。止めて終了しますか？"):
+        if self.engine.recording and not messagebox.askokcancel("REPLAY", "RECORDING. STOP AND CLOSE?"):
             return
         self.engine.shutdown()
         self.root.destroy()
 
 
-class SettingsDialog(tk.Toplevel):
+def short_device(label):
+    if not label:
+        return ""
+    name = label.split("] ", 1)[-1]
+    return name if len(name) <= 38 else name[:37] + "…"
+
+
+class SettingsView(tk.Frame):
+    """同じウィンドウの中に開く設定画面。"""
+
     def __init__(self, app):
-        super().__init__(app.root)
+        super().__init__(app.root, bg=BG)
         self.app = app
-        app.dialog_open = True
-        self.title("設定")
-        self.configure(bg=BG, padx=16, pady=14)
-        self.transient(app.root)
-        self.protocol("WM_DELETE_WINDOW", self.cancel)
+        px = app.px
         cfg = app.cfg
-        self.ins = list_devices("in")
-        self.outs = list_devices("out")
         self.v_in = tk.StringVar(value=cfg["input_device"])
         self.v_out = tk.StringVar(value=cfg["output_device"])
         self.v_in_ch = tk.StringVar(value=str(cfg["input_channel"]))
         self.v_main = tk.StringVar(value=str(cfg["main_channel"]))
         self.v_cue = tk.StringVar(value=str(cfg["cue_channel"]))
         self.v_rate = tk.StringVar(value=str(cfg["samplerate"]))
-        self.v_latency = tk.StringVar(value=cfg["latency"])
-        self.v_offset = tk.StringVar(value=f"{float(cfg.get('down_offset', 0.0)):g}")
+        self.v_latency = tk.StringVar(value=str(cfg["latency"]).upper())
+        self.v_exclusive = tk.StringVar(value="ON" if cfg.get("exclusive", True) else "OFF")
+        self.v_offset = tk.StringVar(value=f"{float(cfg.get('mark_offset', 2.0)):g}")
         self.v_dir = tk.StringVar(value=cfg["save_dir"])
+        self.load_devices()
 
-        self.c_in = self.row(0, "入力デバイス", self.v_in, [d[1] for d in self.ins], 58)
-        self.c_in_ch = self.row(1, "入力チャンネル", self.v_in_ch, [])
-        self.c_out = self.row(2, "出力デバイス", self.v_out, [d[1] for d in self.outs], 58)
-        self.c_main = self.row(3, "本線のチャンネル", self.v_main, [])
-        self.c_cue = self.row(4, "検聴のチャンネル", self.v_cue, [])
-        rate_box = self.row(5, "サンプルレート", self.v_rate, ["44100", "48000", "96000"])
+        header = tk.Frame(self, bg=BG)
+        header.pack(fill="x", pady=(0, px(14)))
+        tk.Label(header, text="設定", font=app.f_title, fg=TEXT, bg=BG).pack(side="left")
+        RoundButton(app, header, text="BACK  Esc", on_click=self.back, width=112).pack(side="right")
+
+        panels = tk.Frame(self, bg=BG)
+        panels.pack(fill="both", expand=True)
+        panels.columnconfigure((0, 1), weight=1, uniform="panel")
+        left_panel = RoundPanel(app, panels, pad=20)
+        left_panel.grid(row=0, column=0, sticky="new", padx=(0, px(7)))
+        right_panel = RoundPanel(app, panels, pad=20)
+        right_panel.grid(row=0, column=1, sticky="new", padx=(px(7), 0))
+        left, right = left_panel.inner, right_panel.inner
+        tk.Label(left, text="INPUT", font=app.f_mid, fg=TEXT, bg=PANEL).pack(anchor="w")
+        self.c_in = self.field(left, "デバイス", self.v_in, [d[1] for d in self.ins])
+        self.c_in_ch = self.field(left, "CH", self.v_in_ch, [])
+        rate_box = self.field(left, "SAMPLE RATE", self.v_rate, ["44100", "48000", "96000"])
         if app.engine.timeline.head or app.engine.writer is not None:
-            rate_box.configure(state="disabled")  # 録音済みの途中では変えられない
-        self.row(6, "遅延", self.v_latency, ["low", "high"])
-        self.row(7, "↓の開始位置（マークの何秒前）", self.v_offset, ["0", "1", "2", "3", "5", "10"])
-        tk.Label(self, text="保存先", font=app.f_small, fg=TEXT, bg=BG).grid(row=8, column=0, sticky="w", pady=4)
-        folder = tk.Frame(self, bg=BG)
-        folder.grid(row=8, column=1, sticky="ew")
-        tk.Entry(folder, textvariable=self.v_dir, font=app.f_small, width=48).pack(side="left", fill="x", expand=True)
-        tk.Button(folder, text="選ぶ", font=app.f_small, command=self.pick_dir).pack(side="left", padx=(6, 0))
-        buttons = tk.Frame(self, bg=BG)
-        buttons.grid(row=9, column=0, columnspan=2, sticky="e", pady=(12, 0))
-        tk.Button(buttons, text="キャンセル", font=app.f_small, command=self.cancel, padx=12).pack(side="right")
-        tk.Button(buttons, text="OK", font=app.f_small, command=self.ok, padx=20).pack(side="right", padx=(0, 6))
-        self.c_in.bind("<<ComboboxSelected>>", lambda _e: self.update_channels())
-        self.c_out.bind("<<ComboboxSelected>>", lambda _e: self.update_channels())
-        self.update_channels()
-        self.grab_set()
+            rate_box.configure(state="disabled")
+        self.field(left, "MARK OFFSET (SEC)", self.v_offset, ["0", "1", "2", "3", "5", "10"])
+        tk.Label(left, text="SAVE FOLDER", font=app.f_small, fg=MUTED, bg=PANEL).pack(anchor="w", pady=(px(12), px(4)))
+        folder = tk.Frame(left, bg=PANEL)
+        folder.pack(fill="x")
+        tk.Entry(folder, textvariable=self.v_dir, font=app.f_small, relief="flat", highlightthickness=1,
+                 highlightbackground=LINE, highlightcolor=WAVE).pack(side="left", fill="x", expand=True, ipady=px(8))
+        RoundButton(app, folder, text="BROWSE", on_click=self.pick_dir, width=92, height=38, radius=12, parent_bg=PANEL).pack(side="left", padx=(px(8), 0))
 
-    def row(self, r, label, var, values, width=10):
-        tk.Label(self, text=label, font=self.app.f_small, fg=TEXT, bg=BG).grid(row=r, column=0, sticky="w", padx=(0, 12), pady=4)
-        box = ttk.Combobox(self, textvariable=var, values=values, state="readonly", width=width)
-        box.grid(row=r, column=1, sticky="w")
+        tk.Label(right, text="OUTPUT", font=app.f_mid, fg=TEXT, bg=PANEL).pack(anchor="w")
+        self.c_out = self.field(right, "デバイス", self.v_out, [d[1] for d in self.outs])
+        self.c_main = self.field(right, "MAIN CH", self.v_main, [])
+        self.c_cue = self.field(right, "CUE CH", self.v_cue, [])
+        self.field(right, "LATENCY", self.v_latency, ["LOW", "HIGH"])
+        self.field(right, "EXCLUSIVE (WASAPI)", self.v_exclusive, ["ON", "OFF"])
+        self.c_in.bind("<<ComboboxSelected>>", lambda _e: self.update_channels(), add="+")
+        self.c_out.bind("<<ComboboxSelected>>", lambda _e: self.update_channels(), add="+")
+
+        footer = tk.Frame(self, bg=BG)
+        footer.pack(fill="x", pady=(px(14), 0))
+        RoundButton(app, footer, text="APPLY", on_click=self.apply, width=132, height=48, radius=24, fill=WAVE, outline=WAVE, fg="#ffffff", font=app.f_mid).pack(side="right")
+        RoundButton(app, footer, text="RESCAN", on_click=self.rescan, width=112, height=48, radius=24).pack(side="right", padx=px(10))
+        self.update_channels()
+
+    def load_devices(self):
+        self.ins = list_devices("in")
+        self.outs = list_devices("out")
+
+    def field(self, parent, label, var, values):
+        tk.Label(parent, text=label, font=self.app.f_small, fg=MUTED, bg=PANEL).pack(anchor="w", pady=(self.app.px(12), self.app.px(4)))
+        box = ttk.Combobox(parent, textvariable=var, values=values, state="readonly", style="Light.TCombobox", font=self.app.f_small)
+        box.pack(fill="x")
+        box.bind("<<ComboboxSelected>>", lambda _e: self.focus_set())
         return box
 
     def update_channels(self):
@@ -1417,28 +1733,24 @@ class SettingsDialog(tk.Toplevel):
         if d:
             self.v_dir.set(d)
 
-    def close_dialog(self):
-        self.app.dialog_open = False
-        self.grab_release()
-        self.destroy()
-        self.app.root.focus_force()
+    def rescan(self):
+        rescan_devices()
+        self.load_devices()
+        self.c_in.configure(values=[d[1] for d in self.ins])
+        self.c_out.configure(values=[d[1] for d in self.outs])
+        self.update_channels()
 
-    def ok(self):
-        if self.v_main.get() == self.v_cue.get() and not messagebox.askokcancel(
-                APP_NAME, "本線と検聴が同じチャンネルです。検聴の音が本線に出ます。このまま進めますか？", parent=self):
-            return
+    def back(self):
+        self.app.close_settings()
+
+    def apply(self):
         cfg = dict(self.app.cfg)
         cfg.update(input_device=self.v_in.get(), output_device=self.v_out.get(),
                    input_channel=int(self.v_in_ch.get()), main_channel=int(self.v_main.get()),
                    cue_channel=int(self.v_cue.get()), samplerate=int(self.v_rate.get()),
-                   latency=self.v_latency.get(), down_offset=float(self.v_offset.get()),
-                   save_dir=self.v_dir.get())
-        self.close_dialog()
-        self.app.apply_settings(cfg)
-
-    def cancel(self):
-        self.close_dialog()
-        self.app.start_audio()
+                   latency=self.v_latency.get().lower(), exclusive=self.v_exclusive.get() == "ON",
+                   mark_offset=float(self.v_offset.get()), save_dir=self.v_dir.get())
+        self.app.close_settings(cfg)
 
 
 def self_test():
@@ -1446,8 +1758,10 @@ def self_test():
     report = APP_DIR / "selftest.txt"
     try:
         apis = [a["name"] for a in sd.query_hostapis()]
-        if "ASIO" not in apis:
-            raise RuntimeError(f"ASIO対応のPortAudioが読み込まれていません: {apis}")
+        if "ASIO" in apis:
+            raise RuntimeError(f"ASIOの部品が含まれています: {apis}")
+        if "Windows WASAPI" not in apis:
+            raise RuntimeError(f"WASAPIが使えません: {apis}")
         timeline = Timeline(48000)
         timeline.write(np.sin(np.arange(48000 * 3) * 0.1).astype(np.float32) * 0.1)
         cue = CueRenderer(timeline)

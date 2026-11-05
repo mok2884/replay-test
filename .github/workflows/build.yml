@@ -8,9 +8,9 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -22,6 +22,12 @@ jobs:
           pyinstaller --noconfirm --windowed --onedir --name Replay
           --collect-all _sounddevice_data replay.py
 
+      - name: Remove unused ASIO libraries
+        shell: pwsh
+        run: |
+          Get-ChildItem "dist\Replay" -Recurse -Filter "*asio*" | ForEach-Object { Write-Output $_.FullName; Remove-Item $_.FullName }
+          if (Get-ChildItem "dist\Replay" -Recurse -Filter "*asio*") { exit 1 }
+
       - name: Self-test the exe
         shell: pwsh
         run: |
@@ -30,7 +36,7 @@ jobs:
           if ($p.ExitCode -ne 0) { exit 1 }
           Remove-Item "dist\Replay\selftest.txt"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: Replay-windows
           path: dist/Replay
