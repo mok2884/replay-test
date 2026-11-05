@@ -765,36 +765,38 @@ def tune_windows():
 
 
 # -------------------------------------------------------------- 画面 -------
-BG = "#7f8388"
-PANEL = "#f2f3f4"
-RAISED = "#ffffff"
-LINE = "#555a60"
-TEXT = "#101214"
-MUTED = "#3a3f44"
-WAVE_BG = "#ffffff"
-EMPTY_BG = "#d8dadd"
-RULER_BG = "#2a2d31"
-RULER_TEXT = "#ffffff"
+BG = "#24272b"
+PANEL = "#35393f"
+RAISED = "#484d54"
+LINE = "#6c727a"
+TEXT = "#f4f5f6"
+MUTED = "#c8cbcf"
+WAVE_BG = "#f4f5f6"
+WAVE_TEXT = "#101214"
+EMPTY_BG = "#565b62"
+RULER_BG = "#121416"
+RULER_TEXT = "#f4f5f6"
 RULER_ALERT = "#ff9a9f"
-GRID = "#e4e6e8"
-WAVE = "#0f3f9e"
-MARK = "#b24f00"
-HEAD = "#3a3f44"
-SEG_OFF = "#d0d3d6"
-SEG_A = "#0a6a5e"
-SEG_B = "#a87400"
-SEG_C = "#b42f20"
+GRID = "#dfe1e3"
+WAVE = "#123f9c"
+MARK = "#c75000"
+HEAD = "#2f3338"
+SEG_OFF = "#565b62"
+SEG_A = "#4fc4b1"
+SEG_B = "#f2a93b"
+SEG_C = "#ef7566"
 RED = "#cf2a35"
-RED_TEXT = "#a81c27"
+RED_TEXT = "#ff9a9f"
 GREEN = "#1a7f46"
 YELLOW = "#f2d13c"
 YELLOW_TEXT = "#241d00"
 CUE_LINE = "#8a6800"
 LCD = "#0d0f0e"
 LCD_TEXT = "#f2a93b"
-LED_OK = "#18805f"
-NOTICE = "#101214"
-HEADER_ALERT = "#4a060b"
+LED_OK = "#4fc4b1"
+NOTICE = "#f2d13c"
+HEADER_ALERT = "#ff9a9f"
+CHECK_BG = "#1a1c1f"
 RULER_H = 30
 
 
@@ -951,10 +953,10 @@ class TransportButton(tk.Canvas):
     def redraw(self):
         self.delete("all")
         app, w, h = self.app, self.w, self.h
-        fg = TEXT if self.enabled else "#8f949a"
+        fg = TEXT if self.enabled else "#8d9298"
         if self.round_shape:
-            self.create_oval(1, 1, w - 2, h - 2, fill=TEXT if self.enabled else "#8f949a", outline="")
-            fg = RAISED
+            self.create_oval(1, 1, w - 2, h - 2, fill=TEXT if self.enabled else "#8d9298", outline="")
+            fg = BG
         else:
             round_rect(self, 1, 1, w - 2, h - 2, app.px(12), fill=RAISED, outline=LINE)
         cx = w / 2
@@ -1089,7 +1091,7 @@ class App:
         header.pack(fill="x", pady=(0, px(8)))
         logo = tk.Canvas(header, width=px(22), height=px(22), bg=BG, highlightthickness=0)
         logo.create_oval(1, 1, px(21), px(21), fill=RAISED, outline=LINE)
-        logo.create_arc(px(6), px(6), px(16), px(16), start=30, extent=300, style="arc", outline=WAVE, width=px(2))
+        logo.create_arc(px(6), px(6), px(16), px(16), start=30, extent=300, style="arc", outline=LCD_TEXT, width=px(2))
         logo.pack(side="left", padx=(0, px(8)))
         tk.Label(header, text="チャレンジREC", font=self.f_title, fg=TEXT, bg=BG).pack(side="left")
         self.not_active = tk.Canvas(header, width=px(102), height=px(24), bg=BG, highlightthickness=0)
@@ -1151,7 +1153,7 @@ class App:
         self.speed_label.pack(side="left")
         self.v_keep_pitch = tk.BooleanVar(value=True)
         self.pitch_button = tk.Checkbutton(line, text="KEEP PITCH", variable=self.v_keep_pitch, font=self.f_mono, fg=MUTED,
-                                           bg=PANEL, activebackground=PANEL, activeforeground=TEXT, selectcolor=RAISED, takefocus=0,
+                                           bg=PANEL, activebackground=PANEL, activeforeground=TEXT, selectcolor=CHECK_BG, takefocus=0,
                                            highlightthickness=0, command=self.on_pitch)
         self.pitch_button.pack(side="left", padx=(px(8), 0))
 
@@ -1637,7 +1639,7 @@ class App:
                 break
             if x >= 0:
                 c.create_line(x, 0, x, ruler, fill=RULER_TEXT)
-                c.create_line(x, ruler, x, h, fill=GRID)
+                c.create_line(x, ruler, x, h, fill=GRID if x0 <= x < x1 else LINE)
                 total = int(round(t * 10))
                 hh, rem = divmod(total, 36000)
                 mm, rem = divmod(rem, 600)
@@ -1670,11 +1672,11 @@ class App:
             c.create_polygon(x - tri, ruler, x + tri, ruler, x, ruler + self.px(9), fill=MARK, width=0)
         if self.mode != LIVE and 0 <= x1 <= w:
             c.create_line(x1, ruler, x1, h, fill=HEAD)
-            c.create_text(x1 + self.px(6), h - self.px(8), text="LIVE", anchor="sw", fill=MUTED, font=self.f_mono)
+            c.create_text(x1 + self.px(6), h - self.px(8), text="LIVE", anchor="sw", fill=TEXT, font=self.f_mono)
         pos = self.position()
         x = int(round((pos - start) / spp))
         playing = self.mode == SEARCH and e.cue.playing()
-        color = {LIVE: TEXT, SEARCH: CUE_LINE, ONLINE: RED}[self.mode]
+        color = {LIVE: WAVE_TEXT, SEARCH: CUE_LINE, ONLINE: RED}[self.mode]
         if 0 <= x <= w:
             c.create_line(x, 0, x, h, fill=color, width=self.px(2))
             if self.mode == SEARCH and not playing:
@@ -1812,8 +1814,8 @@ class SettingsView(tk.Frame):
         tk.Label(left, text="SAVE FOLDER", font=app.f_small, fg=MUTED, bg=PANEL).pack(anchor="w", pady=(px(12), px(4)))
         folder = tk.Frame(left, bg=PANEL)
         folder.pack(fill="x")
-        tk.Entry(folder, textvariable=self.v_dir, font=app.f_small, relief="flat", highlightthickness=1,
-                 highlightbackground=LINE, highlightcolor=WAVE).pack(side="left", fill="x", expand=True, ipady=px(8))
+        tk.Entry(folder, textvariable=self.v_dir, font=app.f_small, relief="flat", highlightthickness=1, bg=RAISED, fg=TEXT, insertbackground=TEXT,
+                 highlightbackground=LINE, highlightcolor=LCD_TEXT).pack(side="left", fill="x", expand=True, ipady=px(8))
         RoundButton(app, folder, text="BROWSE", on_click=self.pick_dir, width=92, height=38, radius=12, parent_bg=PANEL).pack(side="left", padx=(px(8), 0))
 
         tk.Label(right, text="OUTPUT", font=app.f_mid, fg=TEXT, bg=PANEL).pack(anchor="w")
