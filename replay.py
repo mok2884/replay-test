@@ -766,9 +766,9 @@ def tune_windows():
 
 # -------------------------------------------------------------- 画面 -------
 BG = "#24272b"
-PANEL = "#35393f"
-RAISED = "#484d54"
-LINE = "#6c727a"
+PANEL = "#43484f"
+RAISED = "#585d65"
+LINE = "#7a8088"
 TEXT = "#f4f5f6"
 MUTED = "#c8cbcf"
 WAVE_BG = "#f4f5f6"
@@ -793,10 +793,12 @@ YELLOW_TEXT = "#241d00"
 CUE_LINE = "#8a6800"
 LCD = "#0d0f0e"
 LCD_TEXT = "#f2a93b"
-LED_OK = "#4fc4b1"
+LED_OK = SEG_A
 NOTICE = "#f2d13c"
 HEADER_ALERT = "#ff9a9f"
-CHECK_BG = "#1a1c1f"
+RASTA_RED = "#d6322f"
+RASTA_YELLOW = "#f2c230"
+RASTA_GREEN = "#1f8a45"
 RULER_H = 30
 
 
@@ -918,6 +920,46 @@ class SegmentMeter(tk.Canvas):
             zone = SEG_A if i < 22 else SEG_B if i < 28 else SEG_C
             self.itemconfigure(item, fill=zone if i < lit else SEG_OFF)
         self.lit = lit
+
+
+class CheckToggle(tk.Canvas):
+    """白いチェックボックス。標準の部品だと暗い色の上で印が見えにくいので自前で描く。"""
+
+    def __init__(self, app, parent, text, var, command):
+        font = tkfont.Font(font=app.f_mono)
+        self.box = app.px(16)
+        self.gap = app.px(6)
+        width = self.box + self.gap + font.measure(text) + 2
+        super().__init__(parent, width=width, height=app.px(24), bg=PANEL, highlightthickness=0, takefocus=0, cursor="hand2")
+        self.app = app
+        self.text = text
+        self.var = var
+        self.command = command
+        self.enabled = True
+        self.bind("<ButtonRelease-1>", self._release)
+        self.redraw()
+
+    def _release(self, _event):
+        if self.enabled:
+            self.var.set(not self.var.get())
+            self.redraw()
+            self.command()
+
+    def set_enabled(self, enabled):
+        if enabled != self.enabled:
+            self.enabled = enabled
+            self.redraw()
+
+    def redraw(self):
+        self.delete("all")
+        app, b = self.app, self.box
+        y0 = (app.px(24) - b) / 2
+        color = "#ffffff" if self.enabled else "#9a9fa5"
+        round_rect(self, 1, y0, b, y0 + b - 1, app.px(3), fill=color, outline="")
+        if self.var.get():
+            self.create_line(1 + b * 0.22, y0 + b * 0.52, 1 + b * 0.42, y0 + b * 0.72, 1 + b * 0.78, y0 + b * 0.28,
+                             fill="#101214", width=max(2, app.px(2)), capstyle="round", joinstyle="round")
+        self.create_text(b + self.gap, app.px(12), text=self.text, anchor="w", fill=MUTED if self.enabled else "#9a9fa5", font=app.f_mono)
 
 
 class TransportButton(tk.Canvas):
@@ -1062,7 +1104,8 @@ class App:
     def build_style(self):
         style = ttk.Style(self.root)
         style.theme_use("clam")
-        style.configure("Horizontal.TScale", background=PANEL, troughcolor=SEG_OFF, bordercolor=LINE, lightcolor=PANEL, darkcolor=LINE)
+        style.configure("Horizontal.TScale", background="#ffffff", troughcolor=SEG_OFF, bordercolor=LINE, lightcolor="#ffffff", darkcolor="#d8dadd")
+        style.map("Horizontal.TScale", background=[("disabled", "#9a9fa5"), ("active", "#ffffff")])
         style.configure("Light.TCombobox", fieldbackground=RAISED, background=PANEL, foreground=TEXT, arrowcolor=TEXT,
                         bordercolor=LINE, lightcolor=LINE, darkcolor=LINE, padding=self.px(8))
         style.map("Light.TCombobox", fieldbackground=[("readonly", RAISED)], foreground=[("readonly", TEXT)],
@@ -1152,9 +1195,7 @@ class App:
         self.speed_label = tk.Label(line, text="1.5×", font=self.f_speed, fg=TEXT, bg=PANEL, width=4)
         self.speed_label.pack(side="left")
         self.v_keep_pitch = tk.BooleanVar(value=True)
-        self.pitch_button = tk.Checkbutton(line, text="KEEP PITCH", variable=self.v_keep_pitch, font=self.f_mono, fg=MUTED,
-                                           bg=PANEL, activebackground=PANEL, activeforeground=TEXT, selectcolor=CHECK_BG, takefocus=0,
-                                           highlightthickness=0, command=self.on_pitch)
+        self.pitch_button = CheckToggle(self, line, "KEEP PITCH", self.v_keep_pitch, self.on_pitch)
         self.pitch_button.pack(side="left", padx=(px(8), 0))
 
         devices = RoundPanel(self, row, pad=7, radius=10)
@@ -1208,8 +1249,8 @@ class App:
         meters_panel.grid(row=0, column=3, sticky="nsew")
         meters_panel.inner.columnconfigure(1, weight=1)
         self.meters = {}
-        for i, (key, text) in enumerate((("in", "INPUT"), ("main", "MAIN L"), ("cue", "CUE R"))):
-            tk.Label(meters_panel.inner, text=text, font=self.f_mono, fg=MUTED, bg=PANEL, width=7, anchor="w").grid(row=i, column=0, padx=(0, px(8)), pady=px(2))
+        for i, (key, text, marker, marker_text) in enumerate((("in", "INPUT", RASTA_RED, "#ffffff"), ("main", "MAIN L", RASTA_YELLOW, "#241d00"), ("cue", "CUE R", RASTA_GREEN, "#ffffff"))):
+            tk.Label(meters_panel.inner, text=text, font=self.f_mono, fg=marker_text, bg=marker, width=7, anchor="center").grid(row=i, column=0, padx=(0, px(8)), pady=px(2))
             m = SegmentMeter(self, meters_panel.inner)
             m.grid(row=i, column=1, sticky="ew")
             self.meters[key] = m
@@ -1699,7 +1740,7 @@ class App:
         state = "disabled" if online else "normal"
         self.rec_button.set_style(enabled=not online)
         self.settings_button.set_style(enabled=not online)
-        self.pitch_button.configure(state=state)
+        self.pitch_button.set_enabled(not online)
         self.speed_scale.configure(state=state)
         playing = online or (self.mode == SEARCH and e.cue.playing())
         for key, button in self.transport.items():
