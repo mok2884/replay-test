@@ -1832,13 +1832,20 @@ class SettingsView(tk.Frame):
         self.v_dir = tk.StringVar(value=cfg["save_dir"])
         self.load_devices()
 
-        header = tk.Frame(self, bg=BG)
+        # 画面いっぱいに広げず、中央に一定の幅で置く
+        self.columnconfigure(0, weight=1)
+        self.columnconfigure(1, minsize=min(px(820), app.root.winfo_screenwidth() - px(40)))
+        self.columnconfigure(2, weight=1)
+        content = tk.Frame(self, bg=BG)
+        content.grid(row=0, column=1, sticky="new", pady=(px(16), 0))
+
+        header = tk.Frame(content, bg=BG)
         header.pack(fill="x", pady=(0, px(14)))
         tk.Label(header, text="設定", font=app.f_title, fg=TEXT, bg=BG).pack(side="left")
         RoundButton(app, header, text="BACK  Esc", on_click=self.back, width=112).pack(side="right")
 
-        panels = tk.Frame(self, bg=BG)
-        panels.pack(fill="both", expand=True)
+        panels = tk.Frame(content, bg=BG)
+        panels.pack(fill="x")
         panels.columnconfigure((0, 1), weight=1, uniform="panel")
         left_panel = RoundPanel(app, panels, pad=20)
         left_panel.grid(row=0, column=0, sticky="new", padx=(0, px(7)))
@@ -1868,7 +1875,7 @@ class SettingsView(tk.Frame):
         self.c_in.bind("<<ComboboxSelected>>", lambda _e: self.update_channels(), add="+")
         self.c_out.bind("<<ComboboxSelected>>", lambda _e: self.update_channels(), add="+")
 
-        footer = tk.Frame(self, bg=BG)
+        footer = tk.Frame(content, bg=BG)
         footer.pack(fill="x", pady=(px(14), 0))
         RoundButton(app, footer, text="APPLY", on_click=self.apply, width=132, height=48, radius=24, fill=WAVE, outline=WAVE, fg="#ffffff", font=app.f_mid).pack(side="right")
         RoundButton(app, footer, text="RESCAN", on_click=self.rescan, width=112, height=48, radius=24).pack(side="right", padx=px(10))
