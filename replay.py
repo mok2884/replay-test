@@ -1076,7 +1076,7 @@ class App:
         root.configure(bg=BG)
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
         root.geometry(f"{min(self.px(1320), sw - 40)}x{min(self.px(860), sh - 90)}")
-        root.minsize(self.px(1000), min(self.px(680), sh - 90))
+        root.minsize(self.px(1160), min(self.px(680), sh - 90))
         if sys.platform == "win32":
             try:
                 root.state("zoomed")  # 全画面での使用が基本
@@ -1155,9 +1155,9 @@ class App:
         tk.Frame(guide, bg=LINE, width=1).pack(side="left", fill="y", padx=(0, px(14)))
         keys = tk.Frame(guide, bg=PANEL)
         keys.pack(side="left", fill="x", expand=True)
-        rows = ((("A–Z", "マーク"), ("↓", "前のマーク"), ("↑", "次のマーク"), ("ESC", "先端に戻る")),
-                (("← →", "2秒"), ("SPACE", "再生 / 止める"), ("SHIFT", "押す間 等倍")))
-        for c in range(4):
+        rows = ((("A–Z", "マーク"), ("⇧A–Z", "カーソルにマーク"), ("↓", "前のマーク"), ("↑", "次のマーク"), ("ESC", "先端に戻る")),
+                (("← →", "2秒"), ("SPACE", "再生 / 止める"), ("SHIFT", "押す間 等倍"), (", .", "波形 縮小 / 拡大")))
+        for c in range(5):
             keys.columnconfigure(c, weight=1, uniform="guide")
         for r, row in enumerate(rows):
             for c, (key, text) in enumerate(row):
@@ -1455,8 +1455,15 @@ class App:
             self.key_jump(-1)
         elif ks == "Right":
             self.key_jump(1)
+        elif ks in ("period", "greater"):
+            self.zoom_keys(True)
+        elif ks in ("comma", "less"):
+            self.zoom_keys(False)
         elif self.is_letter(event):
-            self.add_mark()
+            if self.shift_held or event.state & 0x0001:
+                self.add_mark_at_cursor()
+            else:
+                self.add_mark()
 
     def on_key_release(self, event):
         self.down.discard(event.keycode)
@@ -1533,19 +1540,33 @@ class App:
         self.play_at(self.position() + direction * step)
 
     def add_mark(self):
-        head = self.engine.timeline.head
-        if head == 0:
+        self.insert_mark(self.engine.timeline.head)
+
+    def add_mark_at_cursor(self):
+        """Shift＋文字。探している最中に、今聞いている位置へマークを打つ。"""
+        self.insert_mark(self.position())
+
+    def insert_mark(self, pos):
+        if self.engine.timeline.head == 0:
             self.show_notice("START RECORDING TO MARK")
             return
-        if self.marks and self.marks[-1] == head:
+        i = bisect.bisect_left(self.marks, pos)
+        if i < len(self.marks) and self.marks[i] == pos:
             return
-        self.marks.append(head)
+        self.marks.insert(i, pos)
+        self.current_mark = None
         if self.marks_file is not None:
             try:
                 with open(self.marks_file, "a", encoding="utf-8") as f:
-                    f.write(f"{fmt_clock(head, self.engine.rate)}\n")
+                    f.write(f"{fmt_clock(pos, self.engine.rate)}\n")
             except OSError:
                 log_exception()
+
+    def zoom_keys(self, zoom_in):
+        """キーでの横の拡大・縮小。カーソルは左から1/3のまま。"""
+        new = self.spp / 1.25 if zoom_in else self.spp * 1.25
+        self.spp = min(max(new, 2.0), self.engine.rate * 3600 * 6 / max(1, self.wave.winfo_width()))
+        self.free_view = None
 
     # ---- マウス ----
     def view_start(self, width):
