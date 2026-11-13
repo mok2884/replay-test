@@ -28,7 +28,7 @@ import sounddevice as sd
 import tkinter as tk
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 
-APP_NAME = "REPLAY"
+APP_NAME = "チャレンジANN"
 VERSION = "0.3"
 APP_DIR = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 CONFIG_PATH = APP_DIR / "replay_config.json"
@@ -937,7 +937,7 @@ def read_session(path):
     path = Path(path)
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or "marks" not in data:
-        raise ValueError("チャレンジRECのセッションではありません")
+        raise ValueError("チャレンジANN（チャレンジREC）のセッションではありません")
     audio = None
     for cand in (data.get("audio_relative"), data.get("audio")):
         if cand:
@@ -1021,6 +1021,56 @@ def round_rect(canvas, x0, y0, x1, y1, r, **kw):
     return canvas.create_polygon(pts, smooth=True, splinesteps=12, **kw)
 
 
+def mix(c1, c2, t):
+    """2つの色の間の色。t=0でc1、t=1でc2。"""
+    a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{int(round(x + (y - x) * t)):02x}" for x, y in zip(a, b))
+
+
+def raised(canvas, x0, y0, x1, y1, r, top, bottom, outline, pressed=False, oval=False):
+    """立体のボタンの地を描く。上が明るく下が暗いグラデーションと、下の影。
+    押している間は影を消して2ピクセル沈め、明暗を逆にする。文字を下げる量を返す。"""
+    sink = 2 if pressed else 0
+    if not pressed:
+        if oval:
+            canvas.create_oval(x0, y0 + 2, x1, y1 + 2, fill="#0B0C0E", outline="")
+        else:
+            round_rect(canvas, x0, y0 + 2, x1, y1 + 2, r, fill="#0B0C0E", outline="")
+    y0 += sink
+    y1 += sink
+    if pressed:
+        top, bottom = mix(bottom, "#000000", 0.25), mix(top, "#000000", 0.2)
+    h = int(y1 - y0)
+    rr = (x1 - x0) / 2 if oval else min(r, (x1 - x0) / 2, (y1 - y0) / 2)
+    for i in range(h):
+        if oval:
+            d = abs(i + 0.5 - h / 2)
+            half = np.sqrt(max(0.0, (h / 2) ** 2 - d * d)) * (x1 - x0) / h
+            xa, xb = (x0 + x1) / 2 - half, (x0 + x1) / 2 + half
+            t = min(1.0, np.hypot((x0 + x1) / 2 - (x0 + (x1 - x0) * 0.35), i - h * 0.3) / h * 1.4)
+            color = mix(top, bottom, t)
+        else:
+            if i < rr:
+                d = rr - i - 0.5
+            elif i > h - rr:
+                d = i + 0.5 - (h - rr)
+            else:
+                d = 0.0
+            inset = rr - np.sqrt(max(0.0, rr * rr - d * d)) if d else 0.0
+            xa, xb = x0 + inset, x1 - inset
+            color = mix(top, bottom, i / max(1, h - 1))
+        if xb > xa:
+            canvas.create_line(xa, y0 + i, xb, y0 + i, fill=color)
+    if oval:
+        canvas.create_oval(x0, y0, x1, y1, outline=outline)
+    else:
+        round_rect(canvas, x0, y0, x1, y1, r, fill="", outline=outline)
+        if not pressed:
+            canvas.create_line(x0 + rr, y0 + 1, x1 - rr, y0 + 1, fill=mix(top, "#ffffff", 0.18))
+    return sink
+
+
 def clip_text(font, text, width):
     """幅に収まらない文字は「…」で切る。"""
     if font.measure(text) <= width:
@@ -1065,14 +1115,14 @@ class RoundPanel(tk.Canvas):
 class Btn(tk.Canvas):
     """角の丸いボタン。style で色を選ぶ。使えないときは薄く表示する。"""
 
-    STYLES = {
-        "normal": (PANEL2, LINE2, TEXT),
-        "teal": ("#18211F", "#2F4A46", "#9FD9D1"),
-        "primary": (TEAL, TEAL, TEAL_TEXT),
-        "play": (TEAL, TEAL, "#0E2A27"),
-        "off": (PANEL, LINE2, DIM),
+    STYLES = {  # 上の色、下の色、ふち、文字
+        "normal": ("#3A3F47", "#24272C", "#4A505A", TEXT),
+        "teal": ("#24403C", "#15201E", "#3B6A63", "#A9E3DA"),
+        "primary": ("#7FDCD0", "#45AFA3", "#8FE6DA", TEAL_TEXT),
+        "play": ("#8FE6DA", "#3A9C91", "#4FC1B4", "#0E2A27"),
+        "off": ("#2A2D33", "#1F2226", LINE2, DIM),
     }
-    DISABLED = (PANEL, PANEL2, FAINT)
+    DISABLED = (PANEL, PANEL, PANEL2, FAINT)
 
     def __init__(self, app, parent, text="", on_click=None, width=None, height=30, radius=7, font=None,
                  style="normal", parent_bg=PANEL, kind=None, pad=11, on_disabled=None):
@@ -1090,10 +1140,20 @@ class Btn(tk.Canvas):
         self.enabled = True
         self.on_click = on_click
         self.on_disabled = on_disabled
+        self.pressed = False
         self.bind("<Configure>", lambda _e: self.redraw())
+        self.bind("<ButtonPress-1>", self._press)
         self.bind("<ButtonRelease-1>", self._release)
 
+    def _press(self, _event):
+        if self.enabled:
+            self.pressed = True
+            self.redraw()
+
     def _release(self, event):
+        if self.pressed:
+            self.pressed = False
+            self.redraw()
         if not (0 <= event.x < self.winfo_width() and 0 <= event.y < self.winfo_height()):
             return
         if self.enabled:
@@ -1116,17 +1176,27 @@ class Btn(tk.Canvas):
         w, h = self.winfo_width(), self.winfo_height()
         if w < 4 or h < 4:
             return
-        fill, outline, fg = self.STYLES[self.style] if self.enabled else self.DISABLED
+        top, bottom, outline, fg = self.STYLES[self.style] if self.enabled else self.DISABLED
+        if not self.enabled and self.kind not in ("play", "stop"):
+            round_rect(self, 1, 1, w - 2, h - 4, self.radius, fill=top, outline=outline)
+            self.create_text(w / 2, (h - 3) / 2, text=self.text, fill=fg, font=self.font)
+            return
         if self.kind in ("play", "stop"):
-            self.create_oval(1, 1, w - 2, h - 2, fill=fill, outline=outline)
-            cx, cy, s = w / 2, h / 2, min(w, h) * 0.2
+            d = min(w, h - 3) - 2
+            x0 = (w - d) / 2
+            if self.enabled:
+                dy = raised(self, x0, 1, x0 + d, 1 + d, 0, top, bottom, outline, self.pressed, oval=True)
+            else:
+                self.create_oval(x0, 1, x0 + d, 1 + d, fill=top, outline=outline)
+                dy = 0
+            cx, cy, s = w / 2, 1 + d / 2 + dy, d * 0.2
             if self.kind == "play":
                 self.create_polygon(cx - s * 0.75, cy - s, cx - s * 0.75, cy + s, cx + s * 1.05, cy, fill=fg, outline="")
             else:
                 self.create_rectangle(cx - s * 0.8, cy - s * 0.8, cx + s * 0.8, cy + s * 0.8, fill=fg, outline="")
             return
-        round_rect(self, 1, 1, w - 2, h - 2, self.radius, fill=fill, outline=outline)
-        self.create_text(w / 2, h / 2, text=self.text, fill=fg, font=self.font)
+        dy = raised(self, 1, 1, w - 2, h - 4, self.radius, top, bottom, outline, self.pressed)
+        self.create_text(w / 2, (h - 3) / 2 + dy, text=self.text, fill=fg, font=self.font)
 
 
 class KeyCap(tk.Canvas):
@@ -1141,13 +1211,28 @@ class KeyCap(tk.Canvas):
 
 
 class EnterBlock(tk.Canvas):
-    """ENTER（ONLINE PLAY）の表示。キーで操作するので、押しても何も起きない。"""
+    """ENTER（ONLINE PLAY）。クリックしても Enter キーと同じに動く。"""
 
     def __init__(self, app, parent):
-        super().__init__(parent, width=app.px(108), height=app.px(70), bg=BG, highlightthickness=0, takefocus=0)
+        super().__init__(parent, width=app.px(108), height=app.px(70), bg=BG, highlightthickness=0, takefocus=0, cursor="hand2")
         self.app = app
         self.state = None
+        self.pressed = False
         self.bind("<Configure>", lambda _e: self.redraw(force=True))
+        self.bind("<ButtonPress-1>", self._press)
+        self.bind("<ButtonRelease-1>", self._release)
+
+    def _press(self, _event):
+        if self.state != "memo":
+            self.pressed = True
+            self.redraw(force=True)
+
+    def _release(self, event):
+        if self.pressed:
+            self.pressed = False
+            self.redraw(force=True)
+        if 0 <= event.x < self.winfo_width() and 0 <= event.y < self.winfo_height():
+            self.app.enter_click()
 
     def redraw(self, state=None, force=False):
         state = state or self.state or "normal"
@@ -1169,11 +1254,11 @@ class EnterBlock(tk.Canvas):
             self.create_text(w / 2, h * 0.74, text="いまは出せません\nEnter で確定", fill=MUTED, font=app.f_tiny, justify="center")
             return
         online = state == "online"
-        fill, outline, fg = (RED, RED_SOFT, "#ffffff") if online else (TEAL_DARK, TEAL, "#9FD9D1")
-        round_rect(self, 1, 1, w - 2, h - 2, px(10), fill=fill, outline=outline)
-        self.create_text(w - px(9), px(9), text="ENTER", anchor="ne", fill=fg, font=app.f_tiny_mono)
-        self.create_text(w / 2, h * 0.42, text="ONLINE", fill=fg, font=app.f_enter)
-        self.create_text(w / 2, h * 0.68, text="STOP" if online else "PLAY", fill=fg, font=app.f_enter)
+        top, bottom, outline, fg = ("#EC5A55", "#C23733", RED_SOFT, "#ffffff") if online else ("#24403C", "#121A19", TEAL, "#A9E3DA")
+        dy = raised(self, 1, 1, w - 2, h - 4, px(10), top, bottom, outline, self.pressed)
+        self.create_text(w - px(9), px(9) + dy, text="ENTER", anchor="ne", fill=fg, font=app.f_tiny_mono)
+        self.create_text(w / 2, h * 0.41 + dy, text="ONLINE", fill=fg, font=app.f_enter)
+        self.create_text(w / 2, h * 0.66 + dy, text="STOP" if online else "PLAY", fill=fg, font=app.f_enter)
 
 
 class VUMeter(tk.Canvas):
@@ -1362,12 +1447,17 @@ class SpeedPills(tk.Canvas):
         half_w, half_h = px(14), px(10)
         for c, v in zip(cs, SPEEDS):
             on = abs(v - current) < 0.05
+            y0, y1 = h / 2 - half_h - 1, h / 2 + half_h - 2
+            if not self.enabled:
+                round_rect(self, c - half_w, y0, c + half_w, y1, px(5), fill=LINE2 if on else PANEL, outline="")
+                self.create_text(c, (y0 + y1) / 2, text=f"{v:.1f}", fill=MUTED if on else FAINT, font=app.f_mono11_b if on else app.f_mono11)
+                continue
             if on:
-                fill, fg, font = (TEAL if self.enabled else LINE2), (TEAL_TEXT if self.enabled else MUTED), app.f_mono11_b
+                top, bottom, outline, fg, font = "#7FDCD0", "#45AFA3", "#8FE6DA", TEAL_TEXT, app.f_mono11_b
             else:
-                fill, fg, font = PANEL, ("#B4BAC2" if self.enabled else FAINT), app.f_mono11
-            round_rect(self, c - half_w, h / 2 - half_h, c + half_w, h / 2 + half_h, px(5), fill=fill, outline="")
-            self.create_text(c, h / 2, text=f"{v:.1f}", fill=fg, font=font)
+                top, bottom, outline, fg, font = "#33373E", "#24272C", "#3E434B", "#B4BAC2", app.f_mono11
+            raised(self, c - half_w, y0, c + half_w, y1, px(5), top, bottom, outline)
+            self.create_text(c, (y0 + y1) / 2, text=f"{v:.1f}", fill=fg, font=font)
 
 
 class MarkList(tk.Canvas):
@@ -1492,7 +1582,7 @@ class MarkList(tk.Canvas):
 
 
 class Frost:
-    """メモ入力中に、波形以外へかぶせる黒いすりガラス。Windowsだけ。"""
+    """メモ入力中に、波形以外へかぶせる白っぽいすりガラス。Windowsだけ。"""
 
     KEY = "#ff00fe"
 
@@ -1509,15 +1599,15 @@ class Frost:
         win = tk.Toplevel(root)
         win.withdraw()
         win.overrideredirect(True)
-        win.attributes("-alpha", 0.64)
+        win.attributes("-alpha", 0.42)
         win.attributes("-transparentcolor", self.KEY)
         win.transient(root)
-        c = tk.Canvas(win, bg="#0A0B0D", highlightthickness=0, cursor="arrow")
+        c = tk.Canvas(win, bg="#C9D0D6", highlightthickness=0, cursor="arrow")
         c.pack(fill="both", expand=True)
         c.bind("<ButtonRelease-1>", lambda _e: self.app.commit_memo())
         rng = np.random.default_rng(7)
         size = 96
-        palette = np.array(["#0A0B0D", "#1E2024", "#2C2F34", "#3C3F44"])
+        palette = np.array(["#C9D0D6", "#E3E7EB", "#F4F6F8", "#B1B8BF"])
         pick = rng.choice(4, size=(size, size), p=(0.70, 0.14, 0.10, 0.06))
         img = tk.PhotoImage(width=size, height=size)
         img.put(" ".join("{" + " ".join(palette[row]) + "}" for row in pick))
@@ -1584,6 +1674,7 @@ class App:
         self.v_gain = 1.0
         self.free_view = None
         self.online_started = 0.0
+        self.online_start_pos = 0
         self.down = set()
         self.shift_held = False
         self.notice = ""
@@ -1626,7 +1717,7 @@ class App:
         self.f_vu = ("Arial", -max(7, self.px(8)), "bold")
         self.f_vu_big = ("Arial", -self.px(11), "bold")
 
-        root.title(f"チャレンジREC {VERSION}")
+        root.title(f"{APP_NAME} {VERSION}")
         root.configure(bg=BG)
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
         root.geometry(f"{min(self.px(1320), sw - 40)}x{min(self.px(860), sh - 90)}")
@@ -1637,6 +1728,12 @@ class App:
             except tk.TclError:
                 pass
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+        icon = Path(getattr(sys, "_MEIPASS", APP_DIR)) / "icon.ico"
+        if sys.platform == "win32" and icon.exists():
+            try:
+                root.iconbitmap(default=str(icon))
+            except tk.TclError:
+                pass
         self.build_style()
         self.frost = Frost(self)
         self.build_statusbar()
@@ -1741,7 +1838,7 @@ class App:
         brand = tk.Frame(header, bg=BG)
         brand.grid(row=0, column=0, sticky="nw", padx=(0, px(12)))
         header.columnconfigure(0, minsize=px(190))
-        tk.Label(brand, text="チャレンジREC", font=self.f_title, fg=TEXT, bg=BG).pack(anchor="w")
+        tk.Label(brand, text=APP_NAME, font=self.f_title, fg=TEXT, bg=BG).pack(anchor="w")
         self.brand_lines = {}
         for key, title in (("session", "セッション"), ("in", "入力"), ("out", "出力")):
             line = tk.Frame(brand, bg=BG)
@@ -1762,14 +1859,14 @@ class App:
                 ("new", "新規", self.action_new, "normal", busy),
                 ("settings", "設定", self.open_settings, "normal", lambda: self.show_notice("録音を止めてから開いてください")),
                 ("folder", "フォルダ", self.open_folder, "normal", None))):
-            b = Btn(self, files, text=text, on_click=cmd, width=72, height=22, radius=7, style=style, parent_bg=BG, on_disabled=guard)
+            b = Btn(self, files, text=text, on_click=cmd, width=72, height=25, radius=7, style=style, parent_bg=BG, on_disabled=guard)
             b.grid(row=i // 2, column=i % 2, padx=(0, px(4)), pady=(0, px(4)))
             self.file_buttons[key] = b
 
         guide = tk.Frame(header, bg=BG)
         guide.grid(row=0, column=2, sticky="nsew", padx=(0, px(12)))
         tk.Frame(guide, bg=LINE2, width=px(2)).pack(side="left", fill="y", padx=(0, px(10)))
-        tk.Label(guide, text="操作", font=self.f_small_b, fg=MUTED, bg=BG).pack(side="left", anchor="n", pady=(px(4), 0), padx=(0, px(10)))
+        tk.Label(guide, text="操作", font=self.f_small_b, fg=AMBER, bg=BG).pack(side="left", anchor="n", pady=(px(4), 0), padx=(0, px(10)))
         keys = tk.Frame(guide, bg=BG)
         keys.pack(side="left", fill="both", expand=True)
         items = (("A–Z", "マーク"), ("↓ ↑", "マーク移動"), ("← →", "2秒"), ("SPACE", "再生/止める"),
@@ -1802,8 +1899,10 @@ class App:
         self.rec_button = tk.Canvas(header, width=px(96), height=px(70), bg=BG, highlightthickness=0, takefocus=0, cursor="hand2")
         self.rec_button.grid(row=0, column=5, sticky="ns")
         self.rec_state = None
+        self.rec_pressed = False
         self.rec_button.bind("<Configure>", lambda _e: self.draw_rec_button(force=True))
-        self.rec_button.bind("<ButtonRelease-1>", lambda _e: self.toggle_record())
+        self.rec_button.bind("<ButtonPress-1>", lambda _e: self.press_rec(True))
+        self.rec_button.bind("<ButtonRelease-1>", lambda e: self.press_rec(False, e))
 
     def fit_meters(self, width, right):
         """メーターの長さは300くらい。狭い画面では、ボタンが切れないように縮める。"""
@@ -1851,19 +1950,19 @@ class App:
                 ("forward", "+2s", lambda: self.key_jump(1), None, 54),
                 ("next", "MARK ▶▶", lambda: self.key_mark(1), None, 78),
                 ("live", "LIVE ▶▶|", self.transport_live, None, 78)):
-            b = Btn(self, row, text=text, on_click=command, width=width, height=40, radius=7, font=self.f_btn,
+            b = Btn(self, row, text=text, on_click=command, width=width, height=43, radius=7, font=self.f_btn,
                     style="play" if kind else "normal", kind=kind)
             b.pack(side="left", padx=(0, px(6)))
             self.transport[key] = b
         ctrl.inner.bind("<Configure>", lambda e: self.fit_meters(e.width, right), add="+")
         speed = tk.Frame(right, bg=PANEL)
         speed.pack(anchor="w", pady=(px(10), 0))
-        tk.Label(speed, text="検聴速度", font=self.f_small_b, fg=MUTED, bg=PANEL).pack(side="left", padx=(0, px(10)))
+        tk.Label(speed, text="検聴速度", font=self.f_small_b, fg=AMBER, bg=PANEL).pack(side="left", padx=(0, px(10)))
         self.v_speed = tk.DoubleVar(value=1.5)
         self.speed_pills = SpeedPills(self, speed, self.v_speed, self.on_speed)
         self.speed_pills.pack(side="left", padx=(0, px(10)))
         self.v_keep_pitch = tk.BooleanVar(value=True)
-        self.pitch_button = Btn(self, speed, text="KEEP PITCH", on_click=self.on_pitch, height=22, radius=7, font=self.f_small_b, style="teal")
+        self.pitch_button = Btn(self, speed, text="KEEP PITCH", on_click=self.on_pitch, height=25, radius=7, font=self.f_small_b, style="teal")
         self.pitch_button.pack(side="left")
 
         info = RoundPanel(self, left, pad=12)
@@ -1880,7 +1979,7 @@ class App:
         marks.grid(row=0, column=1, sticky="nsew")
         head = tk.Frame(marks.inner, bg=PANEL)
         head.pack(fill="x", padx=px(8), pady=(px(5), px(5)))
-        tk.Label(head, text="マーク", font=self.f_h2, fg=TEXT, bg=PANEL).pack(side="left")
+        tk.Label(head, text="マーク", font=self.f_h2, fg=AMBER, bg=PANEL).pack(side="left")
         self.mark_count = tk.Label(head, text="0", font=self.f_mono11, fg=MUTED, bg=PANEL)
         self.mark_count.pack(side="left", padx=px(8))
         tk.Label(head, text="時刻クリックで移動　ダブルクリックでメモ", font=self.f_tiny, fg=DIM, bg=PANEL).pack(side="right", padx=(px(8), 0))
@@ -1998,7 +2097,7 @@ class App:
             self.show_notice("オーディオが動いていません", 3.0, RED_SOFT)
             return
         if self.source == "file":
-            if not messagebox.askokcancel("チャレンジREC", "読み込んだ音声を閉じて、新しく録音を始めますか？", parent=self.root):
+            if not messagebox.askokcancel(APP_NAME, "読み込んだ音声を閉じて、新しく録音を始めますか？", parent=self.root):
                 self.root.focus_force()
                 return
             if not self.reset_session(ask=True):
@@ -2175,8 +2274,20 @@ class App:
             return
         self.free_view = None
         self.engine.go_online(pos)
+        self.online_start_pos = pos
         self.mode = ONLINE
         self.online_started = time.monotonic()
+
+    def enter_click(self):
+        """ENTERの枠をクリック。キーと同じ決まりで、出す／止める。"""
+        if self.settings_open or self.editing is not None or self.loading:
+            return
+        if self.mode == ONLINE:
+            if time.monotonic() - self.online_started >= ENTER_GUARD_SECONDS:
+                self.engine.stop_online()
+        else:
+            self.key_enter()
+        self.root.focus_set()
 
     def key_space(self):
         if self.mode != SEARCH:
@@ -2283,6 +2394,7 @@ class App:
         entry.focus_force()
         entry.icursor("end")
         entry.update_idletasks()
+        ime_set(self.root, True)  # Windowsではキー入力がウィンドウ全体に届くので、入力中だけ全体をオンにする
         ime_set(entry, True)
         self.enter_block.redraw("memo")
         self.update_frost()
@@ -2325,6 +2437,7 @@ class App:
 
     def end_memo(self):
         self.frost.hide()
+        ime_set(self.root, False)
         if self.edit_entry is not None:
             try:
                 self.mark_list.delete(self.edit_item)
@@ -2356,7 +2469,7 @@ class App:
 
     def confirm_discard(self):
         if self.dirty and (self.marks or self.memos):
-            ok = messagebox.askokcancel("チャレンジREC", "保存していないマークやメモがあります。閉じてもいいですか？", parent=self.root)
+            ok = messagebox.askokcancel(APP_NAME, "保存していないマークやメモがあります。閉じてもいいですか？", parent=self.root)
             self.root.focus_force()
             return ok
         return True
@@ -2631,8 +2744,11 @@ class App:
         if self.loading and self.loading["done"]:
             self.finish_load(self.loading)
         if self.mode == ONLINE and not e.online:
+            # Enterで止めたら、出した頭に戻してSTANDBY（フェーダーを上げ忘れたときに、そのまま出し直せる）。
+            # 録音の先端まで出し切ったときは、先端で止まったまま
             self.mode = SEARCH
-            e.cue.locate(e.online_pos)
+            self.current_mark = None
+            e.cue.locate(e.online_pos if e.online_ended else self.online_start_pos)
         if self.free_view is not None and self.mode == SEARCH and e.cue.playing():
             self.free_view = None
         if self.autosave_at and now >= self.autosave_at:
@@ -2693,10 +2809,16 @@ class App:
             c.create_text(w / 6, h / 2, text=side, fill=fg, font=self.f_band_side)
             c.create_text(w * 5 / 6, h / 2, text=side, fill=fg, font=self.f_band_side)
 
+    def press_rec(self, down, event=None):
+        self.rec_pressed = down
+        self.draw_rec_button()
+        if not down and event is not None and 0 <= event.x < self.rec_button.winfo_width() and 0 <= event.y < self.rec_button.winfo_height():
+            self.toggle_record()
+
     def draw_rec_button(self, force=False):
         rec = self.engine.recording
         enabled = self.mode != ONLINE and not self.loading and self.editing is None
-        state = (rec, enabled)
+        state = (rec, enabled, self.rec_pressed)
         if state == self.rec_state and not force:
             return
         self.rec_state = state
@@ -2706,15 +2828,17 @@ class App:
         if w < 10:
             return
         if rec:
-            fill, outline, fg, word, sub = RED, RED, "#ffffff", "● 録音中", "REC STOP"
+            top, bottom, outline, fg, word, sub = "#EC5A55", "#C23733", "#F07A75", "#ffffff", "● 録音中", "REC STOP"
         else:
-            fill, outline, fg, word, sub = PANEL, RED, RED_SOFT, "● 録音開始", "REC START"
+            top, bottom, outline, fg, word, sub = "#2E3238", "#1B1D21", RED, RED_SOFT, "● 録音開始", "REC START"
         if not enabled:
-            outline = "#7a3330" if rec else LINE2
+            round_rect(c, 1, 1, w - 2, h - 4, self.px(10), fill="#8a3431" if rec else PANEL, outline="#7a3330" if rec else LINE2)
+            dy = 0
             fg = "#f0c9c7" if rec else FAINT
-        round_rect(c, 1, 1, w - 2, h - 2, self.px(10), fill=fill, outline=outline)
-        c.create_text(w / 2, h / 2 - self.px(8), text=word, fill=fg, font=self.f_rec)
-        c.create_text(w / 2, h / 2 + self.px(11), text=sub, fill=fg, font=self.f_rec_sub)
+        else:
+            dy = raised(c, 1, 1, w - 2, h - 4, self.px(10), top, bottom, outline, self.rec_pressed)
+        c.create_text(w / 2, (h - 3) / 2 - self.px(8) + dy, text=word, fill=fg, font=self.f_rec)
+        c.create_text(w / 2, (h - 3) / 2 + self.px(11) + dy, text=sub, fill=fg, font=self.f_rec_sub)
 
     def draw_wave(self):
         c = self.wave
@@ -2923,7 +3047,7 @@ class App:
             return
         self.commit_memo()
         if self.engine.recording:
-            if not messagebox.askokcancel("チャレンジREC", "録音中です。止めて閉じますか？", parent=self.root):
+            if not messagebox.askokcancel(APP_NAME, "録音中です。止めて閉じますか？", parent=self.root):
                 return
         elif not self.confirm_discard():
             return
@@ -2946,7 +3070,7 @@ class Seg(tk.Canvas):
     """少ない選択肢を横に並べて選ぶ。"""
 
     def __init__(self, app, parent, options, var, enabled=True):
-        super().__init__(parent, height=app.px(30), bg=PANEL, highlightthickness=0, takefocus=0, cursor="hand2")
+        super().__init__(parent, height=app.px(33), bg=PANEL, highlightthickness=0, takefocus=0, cursor="hand2")
         self.app = app
         self.options = list(options)
         self.var = var
@@ -2976,12 +3100,16 @@ class Seg(tk.Canvas):
         current = self.var.get()
         for (x0, x1), opt in zip(self._cells(), self.options):
             on = opt == current
+            if not self.enabled:
+                round_rect(self, x0 + 1, 1, x1 - 1, h - 4, app.px(7), fill=LINE2 if on else BG, outline=LINE2)
+                self.create_text((x0 + x1) / 2, (h - 3) / 2, text=opt, fill=MUTED if on else FAINT, font=app.f_mono11_b if on else app.f_mono11)
+                continue
             if on:
-                fill, outline, fg, font = (TEAL, "", TEAL_TEXT, app.f_mono11_b) if self.enabled else (LINE2, "", MUTED, app.f_mono11_b)
+                top, bottom, outline, fg, font = "#7FDCD0", "#45AFA3", "#8FE6DA", TEAL_TEXT, app.f_mono11_b
             else:
-                fill, outline, fg, font = BG, LINE2, ("#B4BAC2" if self.enabled else FAINT), app.f_mono11
-            round_rect(self, x0 + 1, 1, x1 - 1, h - 2, app.px(7), fill=fill, outline=outline)
-            self.create_text((x0 + x1) / 2, h / 2, text=opt, fill=fg, font=font)
+                top, bottom, outline, fg, font = "#33373E", "#24272C", "#3E434B", "#B4BAC2", app.f_mono11
+            raised(self, x0 + 1, 1, x1 - 1, h - 4, app.px(7), top, bottom, outline)
+            self.create_text((x0 + x1) / 2, (h - 3) / 2, text=opt, fill=fg, font=font)
 
 
 class SettingsView(tk.Frame):
@@ -3015,7 +3143,7 @@ class SettingsView(tk.Frame):
         header = tk.Frame(content, bg=BG)
         header.pack(fill="x", pady=(0, px(14)))
         tk.Label(header, text="設定", font=app.f_h1, fg=TEXT, bg=BG).pack(side="left")
-        tk.Label(header, text="チャレンジREC", font=app.f_small, fg=MUTED, bg=BG).pack(side="left", padx=px(12))
+        tk.Label(header, text=APP_NAME, font=app.f_small, fg=MUTED, bg=BG).pack(side="left", padx=px(12))
         Btn(app, header, text="BACK   ESC", on_click=self.back, height=30, radius=8, parent_bg=BG).pack(side="right")
         legend = tk.Frame(header, bg=BG)
         legend.pack(side="right", padx=px(16))

@@ -19,25 +19,34 @@ jobs:
 
       - name: Build
         run: >
-          pyinstaller --noconfirm --windowed --onedir --name Replay
+          pyinstaller --noconfirm --windowed --onedir --name ChallengeANN
+          --icon icon.ico --add-data "icon.ico;."
           --collect-all _sounddevice_data --collect-all tkinterdnd2 replay.py
 
       - name: Remove unused ASIO libraries
         shell: pwsh
         run: |
-          Get-ChildItem "dist\Replay" -Recurse -Filter "*asio*" | ForEach-Object { Write-Output $_.FullName; Remove-Item $_.FullName }
-          if (Get-ChildItem "dist\Replay" -Recurse -Filter "*asio*") { exit 1 }
+          Get-ChildItem "dist\ChallengeANN" -Recurse -Filter "*asio*" | ForEach-Object { Write-Output $_.FullName; Remove-Item $_.FullName }
+          if (Get-ChildItem "dist\ChallengeANN" -Recurse -Filter "*asio*") { exit 1 }
+
+      - name: Name the exe チャレンジANN
+        shell: pwsh
+        run: |
+          Rename-Item "dist\ChallengeANN\ChallengeANN.exe" "チャレンジANN.exe"
+          New-Item -ItemType Directory -Path "out" | Out-Null
+          Move-Item "dist\ChallengeANN" "out\チャレンジANN"
+          Get-ChildItem "out\チャレンジANN" | Select-Object -First 5
 
       - name: Self-test the exe
         shell: pwsh
         run: |
-          $p = Start-Process -FilePath "dist\Replay\Replay.exe" -ArgumentList "--self-test" -Wait -PassThru
-          Get-Content "dist\Replay\selftest.txt" -Encoding UTF8
+          $p = Start-Process -FilePath "out\チャレンジANN\チャレンジANN.exe" -ArgumentList "--self-test" -Wait -PassThru
+          Get-Content "out\チャレンジANN\selftest.txt" -Encoding UTF8
           if ($p.ExitCode -ne 0) { exit 1 }
-          Remove-Item "dist\Replay\selftest.txt"
+          Remove-Item "out\チャレンジANN\selftest.txt"
 
       - uses: actions/upload-artifact@v5
         with:
-          name: Replay-windows
-          path: dist/Replay
+          name: ChallengeANN-windows
+          path: out
           if-no-files-found: error
