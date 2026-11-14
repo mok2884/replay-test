@@ -29,7 +29,7 @@ import tkinter as tk
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 APP_NAME = "チャレンジANN"
-VERSION = "0.3"
+VERSION = "0.3 抜け測定テスト版"
 APP_DIR = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 CONFIG_PATH = APP_DIR / "replay_config.json"
 API_ORDER = ("WASAPI", "WDM-KS", "DirectSound", "MME")
@@ -289,6 +289,71 @@ class DiskWriter:
             self.done.set()
 
 
+class TimingLog:
+    """抜け測定のテスト用。入力の塊ごとに、パソコンの時刻と録音位置を CSV に書く。
+    オーディオスレッドでは値をキューに入れるだけ。書き込みは別スレッド。"""
+
+    def __init__(self, path, rate):
+        self.path = Path(path)
+        self.rate = rate
+        self._q = queue.SimpleQueue()
+        self.done = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def push(self, item):
+        self._q.put(item)
+
+    def note(self, text):
+        self._q.put(("note", text))
+
+    def close(self):
+        self._q.put(None)
+
+    def _run(self):
+        rate = self.rate
+        prev = None
+        first = None
+        last_flush = time.monotonic()
+        try:
+            with open(self.path, "w", encoding="utf-8", newline="") as f:
+                f.write(f"# チャレンジANN 抜け測定ログ  rate={rate}  wav={self.path.with_suffix('').with_suffix('.wav').name}\n")
+                f.write("# jump_ms: 前の塊の時刻＋長さ から見た、この塊の時刻のずれ（＋は遅れて届いた＝抜けの候補）\n")
+                f.write("# offset_ms: 最初の塊から見た「時計の経過 − 録れた長さ」。揺れは戻り、本当の抜けは段になって残る\n")
+                f.write("pos,wav_time,frames,adc_time,current_time,perf,jump_ms,offset_ms,input_overflow,input_underflow\n")
+                while True:
+                    try:
+                        item = self._q.get(timeout=0.5)
+                    except queue.Empty:
+                        item = False
+                    if item is None:
+                        break
+                    if item is not False:
+                        if item[0] == "note":
+                            f.write(f"# {item[1]}\n")
+                            prev = None
+                            first = None
+                        else:
+                            pos, frames, adc, cur, perf, ovf, unf = item
+                            t = adc if adc > 0 else perf
+                            jump = (t - (prev[0] + prev[1] / rate)) * 1000 if prev else 0.0
+                            if first is None:
+                                first = (t, pos)
+                            offset = ((t - first[0]) - (pos - first[1]) / rate) * 1000
+                            prev = (t, frames)
+                            sec = pos / rate
+                            wt = f"{int(sec // 3600)}:{int(sec % 3600 // 60):02d}:{sec % 60:06.3f}"
+                            f.write(f"{pos},{wt},{frames},{adc:.6f},{cur:.6f},{perf:.6f},{jump:.3f},{offset:.3f},{int(ovf)},{int(unf)}\n")
+                    now = time.monotonic()
+                    if now - last_flush >= 1.0:
+                        f.flush()
+                        last_flush = now
+        except Exception:
+            log_exception()
+        finally:
+            self.done.set()
+
+
 # ------------------------------------------------------------- 検聴 -----------
 class CueRenderer:
     """検聴用の音を、別スレッドで少し先まで作っておく。"""
@@ -492,6 +557,7 @@ class Engine:
         self.streams = []
         self.recording = False
         self.writer = None
+        self.timing = None
         self.in_channel = 0
         self.main_channel = 0
         self.cue_channel = 1
@@ -520,8 +586,17 @@ class Engine:
         self.cue = CueRenderer(self.timeline)
 
     # ---- オーディオスレッド ----
-    def _on_input(self, indata, status):
+    def _on_input(self, indata, status, time_info=None):
         self.last_in = time.monotonic()
+        timing = self.timing
+        if self.recording and timing is not None:
+            try:
+                adc = float(time_info.inputBufferAdcTime) if time_info is not None else 0.0
+                cur = float(time_info.currentTime) if time_info is not None else 0.0
+            except Exception:
+                adc = cur = 0.0
+            timing.push((self.timeline.head, len(indata), adc, cur, time.perf_counter(),
+                         bool(status.input_overflow), bool(status.input_underflow)))
         if status.input_overflow or status.input_underflow:
             self.problems += 1
         x = indata[:, self.in_channel]
@@ -578,7 +653,7 @@ class Engine:
 
     def _duplex(self, indata, outdata, frames, _t, status):
         try:
-            self._on_input(indata, status)
+            self._on_input(indata, status, _t)
         except Exception:
             self.problems += 1
         try:
@@ -588,7 +663,7 @@ class Engine:
 
     def _input_only(self, indata, _frames, _t, status):
         try:
-            self._on_input(indata, status)
+            self._on_input(indata, status, _t)
         except Exception:
             self.problems += 1
 
@@ -683,13 +758,24 @@ class Engine:
         if self.writer is not None:
             self.writer.close()
             self.writer = None
+        if self.timing is not None:
+            self.timing.close()
+            self.timing = None
 
     def start_recording(self, save_dir):
         if self.writer is None:
             name = f"replay_{datetime.datetime.now():%Y%m%d_%H%M%S}.wav"
             self.writer = DiskWriter(Path(save_dir) / name, self.rate)
+            try:
+                self.timing = TimingLog(self.writer.path.with_suffix(".timing.csv"), self.rate)
+                self.timing.note(f"録音開始 {datetime.datetime.now():%H:%M:%S}")
+            except Exception:
+                log_exception()
+                self.timing = None
         elif self.timeline.head and (not self.timeline.seams or self.timeline.seams[-1] != self.timeline.head):
             self.timeline.seams.append(self.timeline.head)
+            if self.timing is not None:
+                self.timing.note(f"録音再開 {datetime.datetime.now():%H:%M:%S}（ここで時刻が飛ぶのは止めていた分）")
         self.recording = True
 
     def stop_recording(self):
@@ -713,6 +799,9 @@ class Engine:
         self.close()
         self.cue.quit = True
         self.cue.need.set()
+        if self.timing is not None:
+            self.timing.close()
+            self.timing.done.wait(5)
         if self.writer is not None:
             self.writer.close()
             self.writer.done.wait(10)
