@@ -1477,6 +1477,7 @@ class MarkList(tk.Canvas):
         self.bind("<Configure>", lambda _e: self.redraw(force=True))
         self.bind("<ButtonRelease-1>", self._click)
         self.bind("<Double-Button-1>", self._double)
+        self.bind("<Button-3>", self._menu)
 
     def visible(self):
         return max(1, self.winfo_height() // self.row_h)
@@ -1526,6 +1527,25 @@ class MarkList(tk.Canvas):
         i = self.row_at(event.y)
         if i is not None and event.x >= self.x_memo:
             self.app.begin_memo(i)
+
+    def _menu(self, event):
+        """右クリック。その行のマークを削除、または消したマークを元に戻す。"""
+        app = self.app
+        if app.editing is not None:
+            return
+        i = self.row_at(event.y)
+        menu = tk.Menu(self, tearoff=0, bg=PANEL2, fg=TEXT, activebackground=TEAL, activeforeground=TEAL_TEXT,
+                       disabledforeground=FAINT, font=app.f_body, bd=0)
+        if i is not None:
+            n, t = i + 1, fmt_clock(app.marks[i], app.engine.rate)[:8]
+            menu.add_command(label=f"マーク {n}（{t}）を削除", command=lambda: app.delete_mark(i))
+        else:
+            menu.add_command(label="削除（行を右クリック）", state="disabled")
+        menu.add_command(label="元に戻す　Ctrl+Z", command=app.undo_delete, state="normal" if app.deleted_marks else "disabled")
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
 
     def redraw(self, force=False):
         app = self.app
@@ -1660,6 +1680,7 @@ class App:
         self.memos = {}
         self.current_mark = None
         self.list_version = 0
+        self.deleted_marks = []  # 消したマーク（位置, メモ）。Ctrl+Z で新しい順に戻す
         self.editing = None
         self.edit_entry = None
         self.edit_item = None
@@ -2209,6 +2230,8 @@ class App:
                 self.action_save(save_as=bool(event.state & 0x0001))
             elif low == "o":
                 self.action_open()
+            elif low == "z":
+                self.undo_delete()
             return
         if self.loading:
             return
@@ -2358,6 +2381,39 @@ class App:
             self.current_mark += 1
         self.changed()
 
+    def delete_mark(self, i):
+        if self.editing is not None or not 0 <= i < len(self.marks):
+            return
+        pos = self.marks.pop(i)
+        self.deleted_marks.append((pos, self.memos.pop(pos, "")))
+        if self.current_mark is not None:
+            if self.current_mark == i:
+                self.current_mark = None
+            elif self.current_mark > i:
+                self.current_mark -= 1
+        self.changed()
+        self.show_notice(f"マーク {i + 1} を削除しました（Ctrl+Z で元に戻せます）")
+        self.root.focus_set()
+
+    def undo_delete(self):
+        if self.editing is not None:
+            return
+        if not self.deleted_marks:
+            self.show_notice("元に戻すマークはありません")
+            return
+        pos, memo = self.deleted_marks.pop()
+        i = bisect.bisect_left(self.marks, pos)
+        if not (i < len(self.marks) and self.marks[i] == pos):
+            self.marks.insert(i, pos)
+            if self.current_mark is not None and self.current_mark >= i:
+                self.current_mark += 1
+        if memo:
+            self.memos[pos] = memo
+        self.changed()
+        self.mark_list.ensure_visible(i)
+        self.show_notice(f"マーク {i + 1} を元に戻しました")
+        self.root.focus_set()
+
     def changed(self):
         """マークかメモが変わった。一覧を描き直し、録音ファイルの横へ自動で保存する。"""
         self.list_version += 1
@@ -2485,6 +2541,7 @@ class App:
         self.peaks = Peaks(self.engine.timeline)
         self.marks = []
         self.memos = {}
+        self.deleted_marks = []
         self.source = None
         self.file_path = None
         self.session_path = None
@@ -2574,6 +2631,7 @@ class App:
         rate = tl.rate
         self.marks = []
         self.memos = {}
+        self.deleted_marks = []
         for secs, memo in job["marks"]:
             pos = min(max(0, int(round(secs * rate))), tl.head)
             i = bisect.bisect_left(self.marks, pos)
