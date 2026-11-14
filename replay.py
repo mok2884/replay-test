@@ -52,7 +52,6 @@ DEFAULT_CONFIG = {
     "cue_channel": 2,
     "latency": "high",
     "exclusive": True,
-    "mark_offset": 2.0,
     "save_dir": str(APP_DIR / "録音"),
 }
 
@@ -2157,11 +2156,10 @@ class App:
         return i if i >= 0 else None
 
     def jump_to_mark(self, i):
-        """一覧の時刻をクリック。マークの少し前（↓↑と同じ秒数）へ飛ぶ。"""
+        """一覧の時刻をクリック。そのマークの位置へ飛ぶ（止まっていれば止まったまま、再生中なら続ける）。"""
         if self.mode == ONLINE or self.editing is not None or not self.engine.timeline.head or not 0 <= i < len(self.marks):
             return
-        offset = float(self.cfg.get("mark_offset", 2.0)) * self.engine.rate
-        self.jump_keep_state(self.marks[i] - offset)
+        self.jump_keep_state(self.marks[i])
         self.current_mark = i
         self.root.focus_set()
 
@@ -2299,26 +2297,31 @@ class App:
             self.play_at(cue.position())
 
     def key_mark(self, direction):
-        """↓で前のマーク、↑で次のマーク。マークの少し前から検聴する。"""
+        """↓で前のマーク、↑で次のマーク。マークの位置そのものへ飛ぶ。
+        再生中なら飛んだ先から再生を続け、止まっていれば止まったまま。
+        録音の先端（LIVE）からの↓だけは、そのまま検聴を始める（「チャレンジいける？」ですぐ聞けるように）。"""
         if self.mode == ONLINE or self.loading:
             return
         if not self.marks:
             self.show_notice("マークがまだありません")
             return
-        i = self.current_mark
-        if i is None or i >= len(self.marks):
-            pos = self.position()
-            if direction < 0:
-                i = bisect.bisect_right(self.marks, pos) - 1
-            else:
-                i = bisect.bisect_right(self.marks, pos)
+        rate = self.engine.rate
+        pos = self.position()
+        cm = self.current_mark
+        if cm is not None and cm < len(self.marks) and abs(pos - self.marks[cm]) < rate * 1.5:
+            # 飛んだ直後なら、そのマークにいるとみなして隣へ（続けて押せば次々に進む）
+            i = cm + direction
+        elif direction < 0:
+            i = bisect.bisect_left(self.marks, pos - rate * 0.25) - 1
         else:
-            i += direction
+            i = bisect.bisect_right(self.marks, pos + rate * 0.25)
         if not 0 <= i < len(self.marks):
             return
+        if self.mode == LIVE:
+            self.play_at(self.marks[i])
+        else:
+            self.jump_keep_state(self.marks[i])
         self.current_mark = i
-        offset = float(self.cfg.get("mark_offset", 2.0)) * self.engine.rate
-        self.play_at(self.marks[i] - offset)
         self.mark_list.ensure_visible(i)
 
     def key_jump(self, direction):
@@ -3128,7 +3131,6 @@ class SettingsView(tk.Frame):
         self.v_rate = tk.StringVar(value=str(cfg["samplerate"]))
         self.v_latency = tk.StringVar(value=str(cfg["latency"]).upper())
         self.v_exclusive = tk.StringVar(value="ON" if cfg.get("exclusive", True) else "OFF")
-        self.v_offset = tk.StringVar(value=f"{float(cfg.get('mark_offset', 2.0)):g}")
         self.v_dir = tk.StringVar(value=cfg["save_dir"])
         self.watch = []  # (変数, 最初の値, 点, コンボボックス)
         self.load_devices()
@@ -3163,7 +3165,6 @@ class SettingsView(tk.Frame):
         self.c_in_ch = self.combo(left, "CH", self.v_in_ch, [])
         rate_locked = bool(app.engine.timeline.head or app.engine.writer is not None)
         self.seg(left, "SAMPLE RATE", self.v_rate, ["44100", "48000", "96000"], "録音や読み込みがあるときは変えられません" if rate_locked else "", enabled=not rate_locked)
-        self.seg(left, "MARK OFFSET（秒）", self.v_offset, ["0", "1", "2", "3", "5", "10"], "マークの何秒前から検聴するか")
         dot = self.field_head(left, "保存フォルダ", "")
         folder = tk.Frame(left, bg=PANEL)
         folder.pack(fill="x")
@@ -3272,8 +3273,7 @@ class SettingsView(tk.Frame):
         cfg.update(input_device=self.v_in.get(), output_device=self.v_out.get(),
                    input_channel=int(self.v_in_ch.get()), main_channel=int(self.v_main.get()),
                    cue_channel=int(self.v_cue.get()), samplerate=int(self.v_rate.get()),
-                   latency=self.v_latency.get().lower(), exclusive=self.v_exclusive.get() == "ON",
-                   mark_offset=float(self.v_offset.get()), save_dir=self.v_dir.get())
+                   latency=self.v_latency.get().lower(), exclusive=self.v_exclusive.get() == "ON", save_dir=self.v_dir.get())
         self.app.close_settings(cfg)
 
 
