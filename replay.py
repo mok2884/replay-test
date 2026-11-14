@@ -558,6 +558,7 @@ class Engine:
         self.recording = False
         self.writer = None
         self.timing = None
+        self.timing_error = False
         self.in_channel = 0
         self.main_channel = 0
         self.cue_channel = 1
@@ -772,6 +773,7 @@ class Engine:
             except Exception:
                 log_exception()
                 self.timing = None
+                self.timing_error = True
         elif self.timeline.head and (not self.timeline.seams or self.timeline.seams[-1] != self.timeline.head):
             self.timeline.seams.append(self.timeline.head)
             if self.timing is not None:
@@ -2195,6 +2197,10 @@ class App:
         try:
             self.engine.start_recording(self.cfg["save_dir"])
             self.source = "rec"
+            if self.engine.timing is not None:
+                self.show_notice(f"テスト版：{self.engine.timing.path.name} を書いています", 6.0)
+            elif self.engine.timing_error:
+                self.show_notice("テスト版：測定ログを作れませんでした（error.log を見てください）", 10.0, RED_SOFT)
         except OSError as e:
             log_exception()
             self.show_notice(f"録音を始められません: {e}", 6.0, RED_SOFT)

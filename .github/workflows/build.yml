@@ -29,24 +29,24 @@ jobs:
           Get-ChildItem "dist\ChallengeANN" -Recurse -Filter "*asio*" | ForEach-Object { Write-Output $_.FullName; Remove-Item $_.FullName }
           if (Get-ChildItem "dist\ChallengeANN" -Recurse -Filter "*asio*") { exit 1 }
 
-      - name: Name the exe チャレンジANN
+      - name: Name the exe チャレンジANN_テスト版
         shell: pwsh
         run: |
-          Rename-Item "dist\ChallengeANN\ChallengeANN.exe" "チャレンジANN.exe"
+          Rename-Item "dist\ChallengeANN\ChallengeANN.exe" "チャレンジANN_テスト版.exe"
           New-Item -ItemType Directory -Path "out" | Out-Null
-          Move-Item "dist\ChallengeANN" "out\チャレンジANN"
-          Get-ChildItem "out\チャレンジANN" | Select-Object -First 5
+          Move-Item "dist\ChallengeANN" "out\チャレンジANN_テスト版"
+          Get-ChildItem "out\チャレンジANN_テスト版" | Select-Object -First 5
 
       - name: Self-test the exe
         shell: pwsh
         run: |
-          $p = Start-Process -FilePath "out\チャレンジANN\チャレンジANN.exe" -ArgumentList "--self-test" -Wait -PassThru
-          Get-Content "out\チャレンジANN\selftest.txt" -Encoding UTF8
+          $p = Start-Process -FilePath "out\チャレンジANN_テスト版\チャレンジANN_テスト版.exe" -ArgumentList "--self-test" -Wait -PassThru
+          Get-Content "out\チャレンジANN_テスト版\selftest.txt" -Encoding UTF8
           if ($p.ExitCode -ne 0) { exit 1 }
-          Remove-Item "out\チャレンジANN\selftest.txt"
+          Remove-Item "out\チャレンジANN_テスト版\selftest.txt"
 
       - uses: actions/upload-artifact@v5
         with:
-          name: ChallengeANN-windows
+          name: ChallengeANN-TEST-windows
           path: out
           if-no-files-found: error
